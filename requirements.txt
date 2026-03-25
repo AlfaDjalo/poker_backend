@@ -1,4 +1,5 @@
 fastapi
 uvicorn
 pydantic
-git+https://github.com/AlfaDjalo/poker-engine.git
+# git+https://github.com/AlfaDjalo/poker_engine.git
+# -e ../poker_engine

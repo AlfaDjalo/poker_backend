@@ -29,7 +29,7 @@ def state_to_dto(poker_state):
 
         hand = []
 
-        mask = p.mask
+        mask = p.hand_mask
 
         while mask:
 
@@ -49,10 +49,62 @@ def state_to_dto(poker_state):
             )
         )
 
+    current = g.current_player
+    player = g.players[current]
+
+    to_call = g.bet_to_call - player.current_bet
+
+    actions = [a.name.lower() for a in g.legal_actions()]
+
+    print("Actions (backend): ", actions)
+    # actions = []
+
+    # if not player.has_folded:
+
+    #     actions.append("fold")
+
+    #     if to_call > 0:
+    #         actions.append("call")
+    #     else:
+    #         actions.append("check")
+
+    #     if player.stack > to_call:
+
+    #         if g.bet_to_call == 0:
+    #             actions.append("bet")
+    #         else:
+    #             actions.append("raise")
+
+    # Temporary - need to change to reflect betting type
+    min_raise = g.min_raise
+    # min_raise = max(g.min_raise, g.last_raise_size)
+    max_raise = player.stack
+
+    current_player = (
+        g.current_player + 1
+        if poker_state.phase.name == "BETTING"
+        else None
+    )
+
+    print("Phase: ", poker_state.phase)
+    print("Current player: ", current_player)
+
+    # hand_strengths = (
+    #     poker_state.last_showdown.hand_ranks
+    #     if poker_state.lastshowdown else None
+    # )
+
     return GameStateDTO(
         street = g.street_index,
         pot = g.pot,
         board = board,
         players = players,
-        current_player = g.current_player + 1
+        current_player = current_player,
+        phase = poker_state.phase.name,
+        # hand_strengths = hand_strengths,
+
+        available_actions = actions,
+        to_call = max(0, to_call),
+        min_raise = min_raise,
+        max_raise = max_raise
     )
