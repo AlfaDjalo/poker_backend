@@ -49,36 +49,33 @@ def state_to_dto(poker_state):
             )
         )
 
-    current = g.current_player
-    player = g.players[current]
+    # if g.current_player is not None:
+    if poker_state.phase.name == "BETTING":
+        current = g.current_player    
+        player = g.players[current]
+        to_call = g.bet_to_call - player.current_bet
+        max_raise = player.stack
+    else:
+        current = None
+        to_call = 0
+        max_raise = 0
 
-    to_call = g.bet_to_call - player.current_bet
+    # current = g.current_player
+    # player = g.players[current]
 
-    actions = [a.name.lower() for a in g.legal_actions()]
+    # to_call = g.bet_to_call - player.current_bet
+
+    if poker_state.phase.name == "BETTING":
+        actions = [a.name.lower() for a in g.legal_actions()]
+    else:
+        actions = []
 
     print("Actions (backend): ", actions)
-    # actions = []
-
-    # if not player.has_folded:
-
-    #     actions.append("fold")
-
-    #     if to_call > 0:
-    #         actions.append("call")
-    #     else:
-    #         actions.append("check")
-
-    #     if player.stack > to_call:
-
-    #         if g.bet_to_call == 0:
-    #             actions.append("bet")
-    #         else:
-    #             actions.append("raise")
 
     # Temporary - need to change to reflect betting type
     min_raise = g.min_raise
     # min_raise = max(g.min_raise, g.last_raise_size)
-    max_raise = player.stack
+    # max_raise = player.stack
 
     current_player = (
         g.current_player + 1
@@ -89,10 +86,31 @@ def state_to_dto(poker_state):
     print("Phase: ", poker_state.phase)
     print("Current player: ", current_player)
 
-    # hand_strengths = (
-    #     poker_state.last_showdown.hand_ranks
-    #     if poker_state.lastshowdown else None
-    # )
+    showdown = None
+    winners = None
+
+    if hasattr(poker_state, "last_showdown") and poker_state.last_showdown:
+
+        result = poker_state.last_showdown
+
+        showdown = {
+            "payouts": result.payouts,
+            "winners_by_pot": result.winners_by_pot,
+            "scores": [
+                {
+                    "score_type": str(p["score_type"]),
+                    "boards": p["boards"],
+                    "scores": p["scores"],
+                }
+                for p in result.scores
+            ],
+            "boards": result.boards,
+        }
+
+        winners = [
+            p + 1 for p, amt in result.payouts.items()
+            if amt > 0
+        ]
 
     return GameStateDTO(
         street = g.street_index,
@@ -102,6 +120,9 @@ def state_to_dto(poker_state):
         current_player = current_player,
         phase = poker_state.phase.name,
         # hand_strengths = hand_strengths,
+
+        showdown = showdown,
+        winners = winners,
 
         available_actions = actions,
         to_call = max(0, to_call),

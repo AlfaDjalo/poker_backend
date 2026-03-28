@@ -17,8 +17,10 @@ from actions.action_type import ActionType
 
 from app.engine_adapter import state_to_dto
 
+# GAME = "holdem"
 # GAME = "omaha"
-GAME = "holdem"
+# GAME = "plo8"
+GAME = "double_board_plo_bomb_pot"
 
 class GameService:
 
@@ -60,11 +62,11 @@ class GameService:
 
         self.state.step(action)
 
-        self._progress_engine()
+        return self._progress_engine()
 
         # print(state_to_dto(self.state))
 
-        return state_to_dto(self.state)
+        # return state_to_dto(self.state)
     
     def advance_street(self):
         if self.state is None:
@@ -79,15 +81,14 @@ class GameService:
         """
         Automatically advance non-player phases:
         - DEAL_BOARD
-        - SHOWDOWN
         """
 
-        while self.state.phase in (Phase.DEAL_BOARD, Phase.SHOWDOWN):
+        while self.state.phase == Phase.DEAL_BOARD:
             self.state.step(None)
 
         dto = state_to_dto(self.state)
 
-        if self.state.phase == Phase.HAND_COMPLETE:
+        if self.state.phase in [Phase.SHOWDOWN, Phase.HAND_COMPLETE]:
             dto.winners = self._get_winners()
 
         return dto
@@ -95,15 +96,16 @@ class GameService:
 
     def new_hand(self):
 
-        self.state.reset_hand()
+        self.state.start_hand()
 
         return state_to_dto(self.state)
 
 
     def _get_winners(self):
-        stacks = [p.stack for p in self.state.game.players]
-        max_stack = max(stacks)
-        return [i + 1 for i, s in enumerate(stacks) if s == max_stack]
+        # stacks = [p.stack for p in self.state.game.players]
+        # max_stack = max(stacks)
+        # return [i + 1 for i, s in enumerate(stacks) if s == max_stack]
+        return [w + 1 for w in self.state.last_winners]
 
 def to_engine_action(req):
 

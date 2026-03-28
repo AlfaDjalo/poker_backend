@@ -18,6 +18,7 @@ class GameStateDTO(BaseModel):
     players: List[PlayerDTO]
     current_player: Optional[int]
     phase: str
+    showdown: Optional[dict] = None
     winners: Optional[List[int]] = None
     # hand_strengths: Optional[Dict[int, str]]
 
