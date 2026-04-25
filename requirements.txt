@@ -1,5 +1,9 @@
 fastapi
 uvicorn
 pydantic
+sqlalchemy
+psycopg2-binary
+alembic
+python-dotenv
 # git+https://github.com/AlfaDjalo/poker_engine.git
 # -e ../poker_engine

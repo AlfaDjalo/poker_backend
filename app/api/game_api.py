@@ -1,6 +1,9 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
 from pydantic import BaseModel
 
+from app.api.deps import get_db
+from app.services.session_logger import SessionLogger
 from app.services.game_service import game_service
 
 
@@ -15,13 +18,14 @@ class ActionRequest(BaseModel):
 @router.post("/new-hand")
 def new_hand():
     result = game_service.new_hand()
-    # print("DEBUG:", result)
     return result
 
 @router.post("/restart")
-def restart():
+def restart(db: Session = Depends(get_db)):
 
-    return game_service.restart()
+    dto_state = game_service.restart(db)
+    # print("DTO State: ", dto_state)
+    return dto_state
 
 
 @router.get("/state")
@@ -33,18 +37,12 @@ def get_state():
 @router.post("/action")
 def apply_action(req: ActionRequest):
 
-    return game_service.apply_action(req)
+    dto_state = game_service.apply_action(req)
+    return dto_state
 
-# @router.post("/deal_next_street")
-# def deal_next_street():
-#     if game_service.state is None:
-#         return {"error": "No hand in progress"}
-    
-#     game_service.advance_street()
-#     # game_service.state.advance_street()
+@router.post("/start")
+def start_game(config: dict, db: Session = Depends(get_db)):
+    logger = GameLogger(db)
+    logger.start_game(config)
 
-#     return game_service.get_state()
-
-# @router.post("/action")
-# def apply_action(req: ActionRequest):
-#     return game_service.apply_action(req)
+    return {"status": "ok"}
