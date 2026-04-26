@@ -160,7 +160,7 @@ def build_showdown_dto(result, rules, active_players):
     if result is None:
         return None
     
-    point_results = []
+    # point_results = []
 
     grouped = {}
 
@@ -175,11 +175,11 @@ def build_showdown_dto(result, rules, active_players):
                 "boards": []
             }
 
-        grouped[key]["boards"].append((i, p))
+        grouped[key]["boards"].append(p)
 
     point_results_dto = []
 
-    for name, data in grouped.items():
+    for point_idx, (name, data) in enumerate(grouped.items()):
 
         # boards = data["boards"]
 
@@ -188,7 +188,7 @@ def build_showdown_dto(result, rules, active_players):
         no_qualify = []
         scoop = []
 
-        for idx, board_obj in data["boards"]:
+        for board_idx, board_obj in enumerate(data["boards"]):
 
             results = board_obj.results
 
@@ -220,7 +220,7 @@ def build_showdown_dto(result, rules, active_players):
             scoop_flag = False
             if result.scoop_flags:
                 try:
-                    scoop_flag = result.scoop_flags[idx]
+                    scoop_flag = result.scoop_flags[point_idx][board_idx]
                 except (IndexError, TypeError):
                     pass
 
