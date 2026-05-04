@@ -22,11 +22,7 @@ from app.services.engine_callbacks import BackendEngineCallbacks
 from app.db.models.poker_tables import PokerTable
 from app.db.models.players import Player
 
-# GAME = "holdem"
-# GAME = "omaha"
-# GAME = "plo8"
-# GAME = "double_board_plo_bomb_pot"
-GAME = "five_points_high_low_high_low_hand"
+DEFAULT_GAME = "holdem"
 
 class GameService:
 
@@ -34,8 +30,52 @@ class GameService:
         self.state = None
         self.logger = None
         self.callback = None
+        self.current_game = DEFAULT_GAME
+        self.pending_game = None
 
-    def restart(self, db):
+    # --------------------------------------------------
+    # Variant discovery
+    # --------------------------------------------------
+
+    def get_variants(self):
+        """Return all .yaml game definitions found in the engine's games directory."""
+        games_dir = engine_root / "games"
+        if not games_dir.exists():
+            return {"variants": [], "current": self.current_game}
+        names = sorted(p.stem for p in games_dir.glob("*.yaml"))
+        print("Variants: ", names)
+        return {"variants": names, "current": self.current_game}
+
+    # --------------------------------------------------
+    # Game selection (queued; applied between hands only)
+    # --------------------------------------------------
+
+    def select_game(self, game_name: str):
+        """
+        Queue a game change. Applied at the start of the next hand or on
+        a full restart. Raises ValueError if the variant doesn't exist.
+        """
+        games_dir = engine_root / "games"
+        if not (games_dir / f"{game_name}.yaml").exists():
+            raise ValueError(f"Unknown game variant: '{game_name}'")
+        self.pending_game = game_name
+
+    def _apply_pending_game(self, game_name: str | None = None):
+        """ Consume any explicit or queued game selection and return it."""
+        if game_name:
+            self.select_game(game_name)
+        if self.pending_game:
+            self.current_game = self.pending_game
+            self.pending_game = None
+        return self.current_game
+
+    # --------------------------------------------------
+    # Session restart (re-creates PokerState)
+    # --------------------------------------------------
+
+    def restart(self, db, game_name: str | None = None):
+
+        self._apply_pending_game(game_name)
 
         active_table = db.query(PokerTable).first()
         if not active_table:
@@ -51,18 +91,11 @@ class GameService:
         players = [
             PlayerState(stack=100) for _ in db_players
         ]
-        # players = [
-        #     PlayerState(stack=100),
-        #     PlayerState(stack=100),
-        #     PlayerState(stack=100),
-        #     PlayerState(stack=100),
-        #     PlayerState(stack=100),
-        #     PlayerState(stack=100),
-        # ]
 
-        game_def, rules = load_game(GAME)
+        game_def, rules = load_game(self.current_game)
 
         print("GameDef: ", game_def)
+        print("Game variant: ", self.current_game)
 
         scoring_engine = CppScoringEngine()
 
@@ -80,7 +113,6 @@ class GameService:
         self.logger.start_game({
             "table_id": active_table.table_id,
             "player_ids": [p.player_id for p in db_players],
-            # "players": len(players)
         })
 
         self.state.start_hand()
@@ -98,6 +130,10 @@ class GameService:
 
         return state_to_dto(self.state)
     
+    # --------------------------------------------------
+    # State
+    # --------------------------------------------------
+
     def get_state(self):
 
         if self.state is None:
@@ -105,27 +141,26 @@ class GameService:
         
         return state_to_dto(self.state)
     
+    # --------------------------------------------------
+    # Player actions
+    # --------------------------------------------------
+        
     def apply_action(self, req):
 
         if self.state is None:
             return None
         
         action = to_engine_action(req)
-
         self.state.step(action)
 
         return self._progress_engine()
 
-        # print(state_to_dto(self.state))
-
-        # return state_to_dto(self.state)
     
     def advance_street(self):
         if self.state is None:
             return None
         
         self.state.step(None)
-        # self.state.deal_next_street()
 
         return state_to_dto(self.state)
 
@@ -143,22 +178,58 @@ class GameService:
         if self.state.phase in [Phase.SHOWDOWN, Phase.HAND_COMPLETE]:
             dto.winners = self._get_winners()
 
-        # print("DTO: ", dto)
-
         return dto
 
+    # --------------------------------------------------
+    # New hand (within the same session)
+    # --------------------------------------------------
 
-    def new_hand(self):
+    def _build_continuation_players(self):
+        return [PlayerState(stack=p.stack) for p in self.state.game.players]
+
+    def _recreate_state_with_variant(self, game_def, rules):
+        if self.state is None:
+            raise RuntimeError("No active game session. Call /game/restart first.")
+
+        self.state = PokerState(
+            self._build_continuation_players(),
+            game_def,
+            rules,
+            CppScoringEngine(),
+            callbacks=self.callbacks
+        )
+
+    def new_hand(self, game_name: str | None = None):
+        """
+        Start a new hand.  If game_name is supplied (or a pending_game is
+        queued) the variant is switched before dealing.
+ 
+        Note: the API/frontend is responsible for only calling this once the
+        previous hand is HAND_COMPLETE; we don't gate it here.
+        """
+        self._apply_pending_game(game_name)
+
+        game_def, rules = load_game(self.current_game)
+
+        if self.state is None:
+            raise RuntimeError("No active game state. Call /game/restart first.")
+
+        if self.state.game_def.game_name != game_def.game_name:
+            self._recreate_state_with_variant(game_def, rules)
+        else:
+            self.state.game_def = game_def
+            self.state.rules = rules
 
         self.state.start_hand()
 
         return state_to_dto(self.state)
 
 
+    # --------------------------------------------------
+    # Helpers
+    # --------------------------------------------------
+
     def _get_winners(self):
-        # stacks = [p.stack for p in self.state.game.players]
-        # max_stack = max(stacks)
-        # return [i + 1 for i, s in enumerate(stacks) if s == max_stack]
         return [w + 1 for w in self.state.last_winners]
 
 def to_engine_action(req):
