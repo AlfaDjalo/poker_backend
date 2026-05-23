@@ -44,10 +44,11 @@ class ShowdownDTO(BaseModel):
 class GameStateDTO(BaseModel):
     street: int
     pot: int
-    board: List[Optional[str]]          # kept for backwards compatibility - flat list
+    # board: List[Optional[str]]          # kept for backwards compatibility - flat list
     nodes: List[Optional[str]]          # all node cards indexed by node index
     layout_name: Optional[str]          # e.g. "double_board", "wheel"
     game_name: Optional[str]            # e.g. "double_board_plo_bomb_pot"
+    street_names: Optional[List[str]]
     points: Optional[List[PointDTO]]    # point definitions with node_sets
     # board_layout: BoardLayoutDTO        # full layout descriptor
     

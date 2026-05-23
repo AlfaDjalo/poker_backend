@@ -9,6 +9,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.game_api import router as game_router
+from app.api.replay_api import router as replay_router
+
 from app.db.session import engine
 from app.db.base import Base
 
@@ -34,3 +36,4 @@ app.add_middleware(
 )
 
 app.include_router(game_router)
+app.include_router(replay_router)

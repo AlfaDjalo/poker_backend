@@ -32,21 +32,20 @@ class SessionLogger:
         self.db = db
         self.session_id = None
         self.hand_id = None
-        self._action_index = 0
-        self._finish_hand_called = False
+        self._logged_nodes = set()
 
     def start_game(self, config):
         """Start a new poker session for the given table."""
         t_id = config.get("table_id")
 
-        # poker_session = PokerSession(config)
         poker_session = PokerSession(table_id=t_id)
 
         self.db.add(poker_session)
-        self._safe_commit()
+        self.db.commit()
         self.db.refresh(poker_session)
 
         self.session_id = poker_session.session_id
+
         self.active_player_ids = config.get("player_ids", [])
 
         for seat_index, p_id in enumerate(self.active_player_ids):
@@ -56,17 +55,15 @@ class SessionLogger:
                 seat_number=seat_index + 1
             )
             self.db.add(seat)
-        self._safe_commit()
+        self.db.commit()
 
 
     def start_hand(self, config):
 
         print("Config: ", config)
 
-        self._action_index = 0
-        self._finish_hand_called = False
-
         layout_name = config.get("layout_name") or "single_board"
+        game_def = config.get("game_def")
 
         hand = Hand(
             session_id=self.session_id,
@@ -77,14 +74,14 @@ class SessionLogger:
             dealer_seat=config.get("dealer_seat", 0),
             pot=config.get("pot", 0),
             ended_at=config.get("ended_at", None),
-            # players=config.get("players", []),
         )
 
         self.db.add(hand)
         self.db.flush()
-        # self.db.refresh(hand)
 
         self.hand_id = hand.hand_id
+        self._logged_nodes = set()
+        self._node_to_street_map = self._build_node_street_map(game_def)
 
         players_list = config.get("players", [])
         for player_index, p in enumerate(players_list):
@@ -95,7 +92,6 @@ class SessionLogger:
                 continue
 
             cards = mask_to_card_ids(p.hand_mask)
-            # cards = mask_to_cards(p.hand_mask)
 
             for card in cards:
 
@@ -107,7 +103,7 @@ class SessionLogger:
                     visible=True
                 ))
 
-        self._safe_commit()
+        self.db.commit()
 
 
     def log_action(
@@ -116,10 +112,9 @@ class SessionLogger:
             player_index,
             action,
             amount,
-            # state
+            pot_before,
+            stack_before,
     ):
-        self._recover_if_needed()
-
         actual_player_id = self.active_player_ids[player_index]
         a = Action(
             hand_id=self.hand_id,
@@ -128,35 +123,39 @@ class SessionLogger:
             player_id=actual_player_id,
             action_type=action,
             amount=amount,
+            pot_before=pot_before,
+            stack_before=stack_before,
         )
 
         self.db.add(a)
-        self._safe_commit()
+        self.db.commit()
 
     def log_board(self, state):
-
+        """
+        Log any board cards that have been dealt but not yet recorded.
+        Safe to call multiple times — tracks which nodes have already been logged
+        and stamps each card with the street it was dealt on (from board layout config).
+        """
         g = state.game
 
         for node, card in enumerate(g.node_cards):
-
-            if card is not None:
+            if card is not None and (self.hand_id, node) not in self._logged_nodes:
+                card_street = self._node_to_street_map.get(node, 1)
+                
                 self.db.add(BoardCard(
                     hand_id=self.hand_id,
-                    street=g.street_index,
+                    street=card_street,
                     node=node,
                     card=card
                 ))
+                self._logged_nodes.add((self.hand_id, node))
+
+        self.db.commit()
 
 
     def finish_hand(self, state):
-        if self._finish_hand_called:
-            print(f"SessionLogger.finish_hand: already called for hand_id={self.hand_id}, skipping.")
-            return
-        
-        self._finish_hand_called = True
 
-        self._recover_if_needed()
-
+        # Log any board cards not yet captured.
         self.log_board(state)
 
         result = state.last_showdown
@@ -217,40 +216,44 @@ class SessionLogger:
                 point_id=None
             ))
 
-        self._safe_commit()
+        self.db.query(Hand).filter(Hand.hand_id == self.hand_id).update({
+            "pot": sum(result.payouts.values())
+        })
 
+        self.db.commit()
+
+    def _build_node_street_map(self, game_def):
+        """
+        Build a mapping of node index -> street (1-based) from the game definition.
+ 
+        game_def.street_nodes is List[List[int]] where street_nodes[i] contains
+        the node indices dealt on street i (0-based street index, i.e. index 0
+        = flop).  We store as 1-based street numbers so they align with the
+        board_cards.street column convention.
+ 
+        Example — double board bomb pot:
+            street_nodes = [[0,1,2,5,6,7], [3,8], [4,9]]
+            → nodes 0,1,2,5,6,7 get street=1  (flop)
+            → nodes 3,8         get street=2  (turn)
+            → nodes 4,9         get street=3  (river)
+        """
+        node_map = {}
+        if not game_def:
+            return node_map
+ 
+        try:
+            for street_idx, nodes in enumerate(game_def.street_nodes, start=1):
+                for node in nodes:
+                    node_map[node] = street_idx
+        except Exception as e:
+            print(f"Warning: Failed to build node_street_map: {e}")
+ 
+        return node_map
+ 
     def _next_action_index(self):
-        # if not hasattr(self, "_action_index"):
-        #     self._action_index = 0
+        if not hasattr(self, "_action_index"):
+            self._action_index = 0
         val = self._action_index
         self._action_index += 1
         return val
-    
-    def _safe_commit(self):
-        """Commit, rolling back first if the session is in a failed state."""
-        try:
-            self.db.commit()
-        except Exception as exc:
-            print(f"SessionLogger._safe_commit: commit failed ({exc}), rolling back.")
-            try:
-                self.db.rollback()
-            except Exception as rb_exc:
-                print(f"SessionLogger._safe_commit: rollback also failed: {rb_exc}")
-            raise
-
-    def _recover_if_needed(self):
-        """
-        If a previous flush/commit left the session in PendingRollbackError
-        state, issue a rollback so subsequent operations can proceed.
-        """
-        try:
-            # A lightweight probe — if the session is broken this will raise
-            self.db.execute(
-                __import__("sqlalchemy").text("SELECT 1")
-            )
-        except Exception:
-            print("SessionLogger._recover_if_needed: session broken, rolling back.")
-            try:
-                self.db.rollback()
-            except Exception:
-                pass
+ 

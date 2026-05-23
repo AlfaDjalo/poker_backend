@@ -117,16 +117,17 @@ class GameService:
 
         self.state.start_hand()
 
-        self.logger.start_hand({
-            "variant_name": game_def.game_name,
-            "layout_name": game_def.layout_name,
-            "split_pot": (rules.payout_type == "split_pot"),
-            "betting_config_id": 1,
-            "dealer_seat": 0,
-            "pot": 0,
-            "ended_at": None,   
-            "players": self.state.game.players         
-        })
+        # self.logger.start_hand({
+        #     "variant_name": game_def.game_name,
+        #     "layout_name": game_def.layout_name,
+        #     "split_pot": (rules.payout_type == "split_pot"),
+        #     "betting_config_id": 1,
+        #     "dealer_seat": 0,
+        #     "pot": 0,
+        #     "ended_at": None,
+        #     "game_def": game_def,
+        #     "players": self.state.game.players         
+        # })
 
         return state_to_dto(self.state)
     

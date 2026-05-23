@@ -17,6 +17,10 @@ def state_to_dto(poker_state):
     game_def = poker_state.game_def
     rules = poker_state.rules
 
+    street_names = getattr(game_def, "street_names", None)
+
+    print("Game def: ", game_def)
+
     # --------------------------------------------------
     # Legacy flat board: first 5 nodes (holdem/omaha compat)
     # --------------------------------------------------
@@ -131,10 +135,11 @@ def state_to_dto(poker_state):
     return GameStateDTO(
         street = g.street_index,
         pot = g.pot,
-        board = board,
+        # board = board,
         nodes = nodes,
         layout_name = game_def.layout_name,
         game_name = game_def.game_name,
+        street_names = street_names,
         points = points,
         players = players,
         current_player = current_player,

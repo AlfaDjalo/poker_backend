@@ -79,6 +79,7 @@ def get_state():
 def apply_action(req: ActionRequest):
 
     dto_state = game_service.apply_action(req)
+    # print("dto_state: ", dto_state)
     return dto_state
 
 @router.post("/start")

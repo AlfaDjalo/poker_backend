@@ -26,7 +26,8 @@ class BackendEngineCallbacks:
             "dealer_seat": state.game.dealer_position,
             "pot": state.game.pot,
             "ended_at": None,    
-            "players": state.game.players,        
+            "players": state.game.players,
+            "game_def": state.game_def,      
         })
 
         # self.logger.start_hand({
@@ -34,7 +35,7 @@ class BackendEngineCallbacks:
         #     "state": state
         # })
 
-    def on_action(self, state, action, player_index):
+    def on_action(self, state, action, player_index, pot_before, stack_before):
 
         g = state.game
 
@@ -50,6 +51,8 @@ class BackendEngineCallbacks:
             player_index=player_index,
             action=action.type.name,
             amount=action.amount,
+            pot_before=pot_before,
+            stack_before=stack_before,
             # state={
             #     "board": board,
             #     "pot": g.pot,
