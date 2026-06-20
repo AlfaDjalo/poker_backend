@@ -132,6 +132,14 @@ def state_to_dto(poker_state):
             if amt > 0
         ]
 
+    # --------------------------------------------------
+    # Discard pile
+    # --------------------------------------------------
+    discard_pile = []
+    raw_discard = getattr(g, "discard_pile", [])
+    for cid in raw_discard:
+        discard_pile.append(card_to_str(cid))
+
     return GameStateDTO(
         street = g.street_index,
         pot = g.pot,
@@ -152,7 +160,8 @@ def state_to_dto(poker_state):
         available_actions = actions,
         to_call = max(0, to_call),
         min_raise = min_raise,
-        max_raise = max_raise
+        max_raise = max_raise,
+        discard_pile = discard_pile
     )
 
 def build_showdown_dto(result, rules, active_players):

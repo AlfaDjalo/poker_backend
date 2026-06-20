@@ -62,3 +62,4 @@ class GameStateDTO(BaseModel):
     to_call: Optional[int]
     min_raise: Optional[int]
     max_raise: Optional[int]
+    discard_pile: List[str] = []

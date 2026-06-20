@@ -5,19 +5,18 @@ def mask_to_cards(mask):
 
 class BackendEngineCallbacks:
 
-    def __init__(self, logger):
+    def __init__(self, logger, game_service_ref=None):
         self.logger = logger
-        # self.hand_number = 0
+        self._game_service = game_service_ref
+
+    def _is_editing(self):
+        return self._game_service and self._game_service.editing_mode
 
     def on_hand_start(self, state):
 
-        # self.hand_number += 1
-
-        # hole_cards = [
-        #     mask_to_cards(p.hand_mask)
-        #     for p in state.game.players
-        # ]
-
+        if self._is_editing():
+            return
+        
         self.logger.start_hand({
             "variant_name": state.game_def.game_name,
             "layout_name": state.game_def.layout_name,
@@ -37,6 +36,9 @@ class BackendEngineCallbacks:
 
     def on_action(self, state, action, player_index, pot_before, stack_before):
 
+        if self._is_editing():
+            return
+        
         g = state.game
 
         board = [
@@ -62,20 +64,8 @@ class BackendEngineCallbacks:
 
     def on_showdown(self, state, result):
 
+        if self._is_editing():
+            return
+
         self.logger.finish_hand(state)
 
-        # g = state.game
-
-        # board = [
-        #     c for c in g.node_cards
-        #     if c is not None
-        # ]
-
-        # payouts = result.payouts
-
-        # self.logger.finish_hand(
-        #     board=board,
-        #     result={
-        #         "payouts": payouts
-        #     }
-        # )

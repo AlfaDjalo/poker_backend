@@ -22,3 +22,5 @@ from .point_nodes import PointNode
 from .point_results import PointResult
 from .point_cards import PointCard
 from .payouts import Payout
+
+from .annotations import Annotation
