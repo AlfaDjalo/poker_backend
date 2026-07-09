@@ -86,7 +86,12 @@ def state_to_dto(poker_state):
         current = g.current_player    
         player = g.players[current]
         to_call = g.bet_to_call - player.current_bet
-        max_raise = player.stack
+        betting_type = getattr(poker_state.game_def, "betting_type", "no_limit")
+        if betting_type == "pot_limit":
+            pot_raise_max = g.pot + 2 * to_call
+            max_raise = min(player.stack, pot_raise_max)
+        else:
+            max_raise = player.stack
         actions = [a.name.lower() for a in g.legal_actions()]
     else:
         current = None
