@@ -1,0 +1,182 @@
+# app/config/training_config.yaml
+#
+# Config-driven registry of "Trainer" scenario types. The Trainer
+# frontend component reads this (via GET /trainer/scenarios) to
+# populate its scenario dropdown, and TrainerService uses it to build
+# each new random scenario, load the right RL checkpoint, and pick the
+# right "best decision" evaluator — nothing scenario-specific is
+# hardcoded in trainer_service.py itself.
+#
+# IMPORTANT: `positions` and the keys of `actions` must be the SAME
+# set of strings, in [first_to_act, second_to_act] order —
+# TrainerService derives the RL seat index via cfg.positions.index(
+# position) (see trainer_service.py's _rl_seat_for_position), and looks
+# up the live legal-action set via cfg.actions[hero_position]. A
+# mismatch here (river_duo previously declared positions: [SB, BB] but
+# actions: {OOP: [...], IP: [...]}) silently resolves hero's allowed
+# actions to an empty list every hand.
+#
+# To add a new trainable spot in future (e.g. "3bet_or_fold",
+# "flop_cbet"), add a new entry here + a matching evaluator; no other
+# file needs to change unless the new scenario needs genuinely new
+# mechanics (new betting_type, new engine variant yaml, etc).
+
+scenarios:
+
+  push_fold_duo:
+    label: "Push/Fold Heads-Up"
+    description: >
+      Heads-up push-fold trainer. Random effective stack, random
+      position (SB or BB), random hand. Evaluate whether the hero's
+      decision matches the configured "best" answer.
+
+    # poker_engine variant yaml (poker_engine/games/push_fold.yaml) —
+    # drives real legal-action restriction via GameState's push_fold
+    # betting_type branch.
+    engine_variant: push_fold
+
+    # game_name declared to the RL observation / RepresentationInput.
+    # Kept separate from engine_variant on purpose — see
+    # push_fold_service.py's own note: the trained policy's GameEncoder
+    # token was computed from holdem.yaml during training, so inference
+    # must still declare "holdem" even though the engine enforces
+    # push-fold's restricted action set via legal_mask, not game_name.
+    rl_game_name: holdem
+
+    betting_type: push_fold
+
+    # Hero always occupies this engine seat; the opponent (villain)
+    # seat is always the other one. Position (SB/BB) is randomized per
+    # scenario by rotating dealer_position, not by swapping which
+    # engine seat is "hero".
+    hero_seat: 0
+    villain_seat: 1
+
+    # Effective stack range in big blinds, applied to WHICHEVER side has
+    # fewer chips (both stacks are drawn independently and the
+    # smaller one determines what's actually "live" this hand;
+    # push-fold decisions only care about effective stack).
+    stack_bb:
+      min: 5.0
+      max: 20.0
+
+    # Both seats draw independently from stack_bb (not fixed like the
+    # main GameSimulator's push-fold mode, which pins the human to
+    # 100bb) — the trainer's whole point is stack-depth variety.
+    villain_matches_hero_range: true
+
+    small_blind: 1
+    big_blind: 2
+
+    # First-to-act first: SB acts before BB in push-fold.
+    positions: [SB, BB]   # hero's position is drawn uniformly from this list
+
+    # RL agent the hero plays against (villain's decisions, and/or the
+    # "rl_policy" evaluator below if selected).
+    policy:
+      checkpoint_path: "checkpoints/push_fold_duo/ckpt_push_fold.pt"
+      encoder_path: "encoders/encoder_model.keras"
+      encoder_embedding_dim: 32
+      variant: shared_trunk_two_heads
+      # If the checkpoint file is missing, fall back to an untrained
+      # policy (pipeline testing only) instead of failing to start.
+      allow_untrained_fallback: true
+
+    # Pluggable "what was the correct decision" evaluator. `type`
+    # selects the implementation (see app/services/decision_evaluator.py
+    # for the registry); `params` is evaluator-specific config.
+    evaluator:
+      type: rl_policy_frequency
+      params: {}
+
+    # Actions the hero can face at this decision point, and how each
+    # maps to an engine action_type string (see
+    # trainer_service.py's _build_engine_action). TrainerService's
+    # _live_allowed_actions() intersects this with what's actually
+    # legal right now before sending hero_allowed_actions to the
+    # frontend or validating a submitted decision.
+    actions:
+      SB: ["fold", "all_in"]
+      BB: ["fold", "call"]
+
+  river_duo:
+    label: "Heads-Up River"
+    description: >
+      Heads-up river trainer. Fixed 100bb effective stacks, randomized
+      pot size, random position (OOP or IP), random hand, full random
+      board. Evaluate whether the hero's decision (check/bet, or
+      call/fold when facing a bet) matches the trained policy's
+      preferred action.
+
+    # poker_engine variant yaml (poker_engine/games/river.yaml) — deals
+    # hole cards + the full 5-card board immediately, then restricts
+    # the single river betting street to CHECK/BET(pot)/CALL/FOLD via
+    # GameState's river_only branch.
+    engine_variant: river
+
+    # Matches the RL Lab's scenarios/duo_games/river_duo.yaml
+    # game_name: holdem — the trained policy's GameEncoder token was
+    # computed from holdem.yaml during training, so inference must
+    # still declare "holdem" even though the real legal-action set
+    # comes from river.yaml's river_only betting type.
+    rl_game_name: holdem
+
+    betting_type: river_only
+
+    hero_seat: 0
+    villain_seat: 1
+
+    # river_duo.yaml: stack.mode: fixed_bb, stack_bb: 100.0 — both
+    # seats always start the street at the same 100bb effective stack,
+    # unlike push-fold-duo's randomized range. min == max encodes
+    # "fixed" through the existing StackRange shape without needing a
+    # new config field.
+    stack_bb:
+      min: 100.0
+      max: 100.0
+    villain_matches_hero_range: true
+
+    # Dead-money pot carried in from streets this drill doesn't model,
+    # in big blinds — matches scenarios/duo_games/river_duo.yaml's
+    # pot: {mode: randomized_bb, min_pot_bb: 2.0, max_pot_bb: 20.0}.
+    # TrainerService draws a random pot in this range at scenario
+    # start and sets it directly as game.pot (see that module's river
+    # setup — no blinds are posted for this variant).
+    pot_bb:
+      min: 2.0
+      max: 20.0
+
+    small_blind: 1
+    big_blind: 2
+
+    # River's roles are about board position, not blinds — OOP acts
+    # first (river_duo.yaml's start node). This MUST match the keys of
+    # `actions` below exactly, in first-to-act order — see the
+    # module-level note at the top of this file for why (previously
+    # this was [SB, BB], which never matched the OOP/IP-keyed actions
+    # block below, silently zeroing out hero's allowed actions on
+    # every river hand).
+    positions: [OOP, IP]
+
+    policy:
+      checkpoint_path: "checkpoints/river_duo/ckpt_river_duo.pt"
+      encoder_path: "encoders/encoder_model.keras"
+      encoder_embedding_dim: 32
+      variant: shared_trunk_two_heads
+      allow_untrained_fallback: true
+
+    evaluator:
+      type: rl_policy_frequency
+      params: {}
+
+    # Unlike push_fold_duo, a river position's allowed action set is
+    # NOT fixed for the whole hand — OOP sees {check, bet} on its first
+    # decision but {call, fold} if it checked and IP then bet. This
+    # list is the UNION of every action a hero at this position could
+    # ever face across the whole scenario; trainer_service.py's
+    # _live_allowed_actions() narrows it down to exactly what's legal
+    # at the CURRENT decision point (check/bet OR call/fold, never
+    # all four at once) before it ever reaches the frontend.
+    actions:
+      OOP: ["check", "bet", "call", "fold"]
+      IP: ["check", "bet", "call", "fold"]

@@ -2,8 +2,11 @@
 Migration: add is_hypothetical column to hands table.
 Run once: python -m app.db.migrations.add_is_hypothetical
 """
-from app.db.session import engine
+
 from sqlalchemy import text
+
+from app.db.session import engine
+
 
 def upgrade():
     with engine.connect() as conn:

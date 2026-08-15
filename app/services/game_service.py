@@ -1,38 +1,39 @@
-import sys
+# import sys
+# from pathlib import Path
+# project_root = Path(__file__).resolve().parents[3]
+# engine_root = project_root / "poker_engine"
+
+# if str(engine_root) not in sys.path:
+#     sys.path.insert(0, str(engine_root))
+
+from importlib import resources
 from pathlib import Path
-project_root = Path(__file__).resolve().parents[3]
-engine_root = project_root / "poker_engine"
 
-if str(engine_root) not in sys.path:
-    sys.path.insert(0, str(engine_root))
-
-from state.poker_state import PokerState, Phase
-from betting.betting_rules import BettingRules
-from rules.game_definition import GameDefinition
-from state.player_state import PlayerState
-from games.loader import load_game
-from scoring.scoring_engine import CppScoringEngine
-from actions.action import Action
-from actions.action_type import ActionType
-from cards.mask import mask_to_card_ids
-from cards.card import Card as CardObj
+from poker_engine.actions.action import Action
+from poker_engine.actions.action_type import ActionType
+from poker_engine.cards.card import Card as CardObj
+from poker_engine.cards.mask import mask_to_card_ids
+from poker_engine.games.loader import load_game
+from poker_engine.scoring.scoring_engine import CppScoringEngine
+from poker_engine.state.player_state import PlayerState
+from poker_engine.state.poker_state import Phase, PokerState
 
 from app.db.models.actions import Action as ActionModel
-from app.db.models.hole_cards import HoleCard as HoleCardModel
 from app.db.models.board_cards import BoardCard as BoardCardModel
 from app.db.models.hand_points import HandPoint as HandPointModel
-from app.db.models.point_results import PointResult as PointResultModel
-from app.db.models.point_cards import PointCard as PointCardModel
-from app.db.models.payouts import Payout as PayoutModel
 from app.db.models.hands import Hand as HandModel
-
-from app.engine_adapter import state_to_dto
-from app.services.session_logger import SessionLogger
-from app.services.engine_callbacks import BackendEngineCallbacks
-from app.db.models.poker_tables import PokerTable
+from app.db.models.hole_cards import HoleCard as HoleCardModel
+from app.db.models.payouts import Payout as PayoutModel
 from app.db.models.players import Player
+from app.db.models.point_cards import PointCard as PointCardModel
+from app.db.models.point_results import PointResult as PointResultModel
+from app.db.models.poker_tables import PokerTable
+from app.engine_adapter import state_to_dto
+from app.services.engine_callbacks import BackendEngineCallbacks
+from app.services.session_logger import SessionLogger
 
 DEFAULT_GAME = "holdem"
+
 
 class GameService:
 
@@ -51,12 +52,60 @@ class GameService:
 
     def get_variants(self):
         """Return all .yaml game definitions found in the engine's games directory."""
-        games_dir = engine_root / "games"
+        games_dir = Path(str(resources.files("poker_engine") / "games"))
+
         if not games_dir.exists():
             return {"variants": [], "current": self.current_game}
+
+        # games_dir = engine_root / "games"
+        # if not games_dir.exists():
+        #     return {"variants": [], "current": self.current_game}
+
         names = sorted(p.stem for p in games_dir.glob("*.yaml"))
-        print("Variants: ", names)
+        # print("Variants: ", names)
         return {"variants": names, "current": self.current_game}
+
+    def get_variant_config(self, game_name: str):
+        """
+        Read the raw variant YAML and project out the fields the Hand
+        Creation wizard needs: hole_cards, board_layout, creation_phases.
+
+        Returns None if the variant YAML doesn't exist.
+        """
+        import yaml
+
+        games_dir = Path(str(resources.files("poker_engine") / "games"))
+        # if not games_dir.exists():
+        #     return {"variants": [], "current": self.current_game}
+
+        # games_dir = engine_root / "games"
+        yaml_path = games_dir / f"{game_name}.yaml"
+        if not yaml_path.exists():
+            return None
+
+        with open(yaml_path, "r") as f:
+            raw = yaml.safe_load(f) or {}
+
+        board_layout = raw.get("board_layout", {}) or {}
+        betting = raw.get("betting", {}) or {}
+
+        return {
+            "game_name": raw.get("game_name", game_name),
+            "layout_name": raw.get("layout_name", board_layout.get("name")),
+            "hole_cards": raw.get("hole_cards"),
+            "board_layout": {
+                "nodes": board_layout.get("nodes"),
+                "streets": board_layout.get("streets", {}),
+                "street_names": board_layout.get("street_names", {}),
+            },
+            "betting": {
+                "type": betting.get("type"),
+                "small_blind": betting.get("small_blind"),
+                "big_blind": betting.get("big_blind"),
+                "ante": betting.get("ante", 0),
+            },
+            "creation_phases": raw.get("creation_phases", []),
+        }
 
     # --------------------------------------------------
     # Game selection (queued; applied between hands only)
@@ -67,13 +116,18 @@ class GameService:
         Queue a game change. Applied at the start of the next hand or on
         a full restart. Raises ValueError if the variant doesn't exist.
         """
-        games_dir = engine_root / "games"
+        games_dir = Path(str(resources.files("poker_engine") / "games"))
+
+        # if not games_dir.exists():
+
+        # games_dir = engine_root / "games"
         if not (games_dir / f"{game_name}.yaml").exists():
             raise ValueError(f"Unknown game variant: '{game_name}'")
+
         self.pending_game = game_name
 
     def _apply_pending_game(self, game_name: str | None = None):
-        """ Consume any explicit or queued game selection and return it."""
+        """Consume any explicit or queued game selection and return it."""
         if game_name:
             self.select_game(game_name)
         if self.pending_game:
@@ -93,21 +147,22 @@ class GameService:
         if not active_table:
             raise Exception("No poker tables found in database.")
 
-        db_players = db.query(Player).filter(
-            Player.username.in_([f"Player {i}" for i in range(1, 7)])
-        ).order_by(Player.username).all()
+        db_players = (
+            db.query(Player)
+            .filter(Player.username.in_([f"Player {i}" for i in range(1, 7)]))
+            .order_by(Player.username)
+            .all()
+        )
 
         if len(db_players) < 6:
             raise Exception(f"Found only {len(db_players)} players.")
-        
-        players = [
-            PlayerState(stack=100) for _ in db_players
-        ]
+
+        players = [PlayerState(stack=100) for _ in db_players]
 
         game_def, rules = load_game(self.current_game)
 
-        print("GameDef: ", game_def)
-        print("Game variant: ", self.current_game)
+        # print("GameDef: ", game_def)
+        # print("Game variant: ", self.current_game)
 
         scoring_engine = CppScoringEngine()
 
@@ -115,17 +170,15 @@ class GameService:
         self.callbacks = BackendEngineCallbacks(self.logger, game_service_ref=self)
 
         self.state = PokerState(
-            players,
-            game_def,
-            rules,
-            scoring_engine,
-            callbacks=self.callbacks
+            players, game_def, rules, scoring_engine, callbacks=self.callbacks
         )
 
-        self.logger.start_game({
-            "table_id": active_table.table_id,
-            "player_ids": [p.player_id for p in db_players],
-        })
+        self.logger.start_game(
+            {
+                "table_id": active_table.table_id,
+                "player_ids": [p.player_id for p in db_players],
+            }
+        )
 
         self.state.start_hand()
 
@@ -138,11 +191,11 @@ class GameService:
         #     "pot": 0,
         #     "ended_at": None,
         #     "game_def": game_def,
-        #     "players": self.state.game.players         
+        #     "players": self.state.game.players
         # })
 
         return state_to_dto(self.state)
-    
+
     # --------------------------------------------------
     # State
     # --------------------------------------------------
@@ -151,28 +204,27 @@ class GameService:
 
         if self.state is None:
             return None
-        
+
         return state_to_dto(self.state)
-    
+
     # --------------------------------------------------
     # Player actions
     # --------------------------------------------------
-        
+
     def apply_action(self, req):
 
         if self.state is None:
             return None
-        
+
         action = to_engine_action(req)
         self.state.step(action)
 
         return self._progress_engine()
 
-    
     def advance_street(self):
         if self.state is None:
             return None
-        
+
         self.state.step(None)
 
         return state_to_dto(self.state)
@@ -209,14 +261,14 @@ class GameService:
             game_def,
             rules,
             CppScoringEngine(),
-            callbacks=self.callbacks
+            callbacks=self.callbacks,
         )
 
     def new_hand(self, game_name: str | None = None):
         """
         Start a new hand.  If game_name is supplied (or a pending_game is
         queued) the variant is switched before dealing.
- 
+
         Note: the API/frontend is responsible for only calling this once the
         previous hand is HAND_COMPLETE; we don't gate it here.
         """
@@ -236,7 +288,6 @@ class GameService:
         self.state.start_hand()
 
         return state_to_dto(self.state)
-
 
     # --------------------------------------------------
     # Helpers
@@ -258,14 +309,13 @@ class GameService:
         # Snapshot current state for cancel support
         self.pre_edit_snapshot = self._snapshot_state()
         self.editing_mode = True
-        
+
         # Delete DB records for the current hand
         if self.logger and self.logger.hand_id:
             self._delete_hand_records(db, self.logger.hand_id)
 
-
     def apply_edit(self, req):
-        """Apply an edited snapshot to the live game and resume."""               
+        """Apply an edited snapshot to the live game and resume."""
         if not self.editing_mode:
             raise RuntimeError("Not in editing mode. Call /game/edit/begin first.")
 
@@ -273,22 +323,19 @@ class GameService:
         self._load_snapshot_from_request(req)
         self.editing_mode = False
         self.pre_edit_snapshot = None
-        
+
         return self._progress_engine()
-    
 
     def load_edit(self, req):
         """
         Load an arbitrary snapshot (from Replayer).
         Marks as editing_mode so the hand is never saved.
-        """        
+        """
         self._validate_edit_request(req)
 
         game_def, rules = load_game(req.game_name)
 
-        players = [
-            PlayerState(stack=p.stack) for p in req.players
-        ]
+        players = [PlayerState(stack=p.stack) for p in req.players]
 
         self.state = PokerState(
             players,
@@ -303,19 +350,16 @@ class GameService:
 
         return state_to_dto(self.state)
 
-
     def cancel_edit(self):
         """Restore the snapshot taken at begin_edit."""
         if self.pre_edit_snapshot is None:
-            raise RuntimeError("No pre-edit snapshot available.")        
-        
+            raise RuntimeError("No pre-edit snapshot available.")
+
         self._restore_snapshot(self.pre_edit_snapshot)
         self.editing_mode = False
         self.pre_edit_snapshot = None
 
         return state_to_dto(self.state)
-    
-
 
     # ── Snapshot helpers ──────────────────────────────────────────────
 
@@ -378,10 +422,7 @@ class GameService:
         g.min_raise = req.min_raise
 
         # node cards
-        g.node_cards = [
-            CardObj.from_str(c).id if c else None
-            for c in req.node_cards
-        ]
+        g.node_cards = [CardObj.from_str(c).id if c else None for c in req.node_cards]
 
         # discard pile
         if hasattr(g, "discard_pile"):
@@ -404,7 +445,7 @@ class GameService:
             mask = 0
             for cs in p_input.hole_cards:
                 if cs is not None:
-                    mask |= (1 << CardObj.from_str(cs).id)
+                    mask |= 1 << CardObj.from_str(cs).id
             p.hand_mask = mask
 
     def _load_snapshot_from_request(self, req):
@@ -444,13 +485,17 @@ class GameService:
 
         # Delete in FK-safe order
         point_ids = [
-            r[0] for r in db.query(HandPointModel.point_id)
-                            .filter(HandPointModel.hand_id == hand_id).all()
+            r[0]
+            for r in db.query(HandPointModel.point_id)
+            .filter(HandPointModel.hand_id == hand_id)
+            .all()
         ]
         if point_ids:
             pr_ids = [
-                r[0] for r in db.query(PointResultModel.point_result_id)
-                                .filter(PointResultModel.point_id.in_(point_ids)).all()
+                r[0]
+                for r in db.query(PointResultModel.point_result_id)
+                .filter(PointResultModel.point_id.in_(point_ids))
+                .all()
             ]
             if pr_ids:
                 db.query(PointCardModel).filter(
@@ -460,22 +505,31 @@ class GameService:
             db.query(PointResultModel).filter(
                 PointResultModel.point_id.in_(point_ids)
             ).delete(synchronize_session=False)
-        db.query(PayoutModel).filter(PayoutModel.hand_id == hand_id).delete(synchronize_session=False)
-        db.query(HandPointModel).filter(HandPointModel.hand_id == hand_id).delete(synchronize_session=False)
-        db.query(ActionModel).filter(ActionModel.hand_id == hand_id).delete(synchronize_session=False)
-        db.query(HoleCardModel).filter(HoleCardModel.hand_id == hand_id).delete(synchronize_session=False)
-        db.query(BoardCardModel).filter(BoardCardModel.hand_id == hand_id).delete(synchronize_session=False)
-        db.query(HandModel).filter(HandModel.hand_id == hand_id).delete(synchronize_session=False)
+        db.query(PayoutModel).filter(PayoutModel.hand_id == hand_id).delete(
+            synchronize_session=False
+        )
+        db.query(HandPointModel).filter(HandPointModel.hand_id == hand_id).delete(
+            synchronize_session=False
+        )
+        db.query(ActionModel).filter(ActionModel.hand_id == hand_id).delete(
+            synchronize_session=False
+        )
+        db.query(HoleCardModel).filter(HoleCardModel.hand_id == hand_id).delete(
+            synchronize_session=False
+        )
+        db.query(BoardCardModel).filter(BoardCardModel.hand_id == hand_id).delete(
+            synchronize_session=False
+        )
+        db.query(HandModel).filter(HandModel.hand_id == hand_id).delete(
+            synchronize_session=False
+        )
         db.commit()
-
 
 
 def to_engine_action(req):
 
-    return Action(
-        type=ActionType[req.type.upper()],
-        amount=req.amount
-    )
+    return Action(type=ActionType[req.type.upper()], amount=req.amount)
+
 
 def decode_hand_mask(mask, node_mask, player_mask):
     cards = mask_to_card_ids(mask)
@@ -484,5 +538,5 @@ def decode_hand_mask(mask, node_mask, player_mask):
 
     return cards, hole_cards, board_cards
 
-    
+
 game_service = GameService()

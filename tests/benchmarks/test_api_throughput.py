@@ -3,7 +3,7 @@ tests/benchmarks/test_api_throughput.py
 BENCH-BE-01 … BENCH-BE-07
 
 Requires: pytest-benchmark
-Install:  pip install pytest-benchmark
+Install:   pip install pytest-benchmark
 
 Run benchmarks only:
     pytest tests/benchmarks/ --benchmark-only -v
@@ -15,8 +15,9 @@ Note: These are informational — do not gate CI on thresholds unless a
 regression budget is explicitly defined (per §11 of the Backend Test Plan).
 """
 
-import pytest
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 # ─────────────────────────────────────────────────────────────────
 # Shared fixtures
@@ -52,23 +53,45 @@ MOCK_STATE = {
 }
 
 MOCK_EQUITY_RESPONSE = {
-    "equity": {1: {"board1": 0.55}, 2: {"board1": 0.45}},
+    "players": {
+        "1": {"overall_equity_fraction": 0.55, "points": {"high": {"win_share": 0.55}}},
+        "2": {"overall_equity_fraction": 0.45, "points": {"high": {"win_share": 0.45}}},
+    },
     "method": "exact",
     "iterations": 1326,
     "elapsed_ms": 10.0,
 }
 
 MOCK_EQUITY_RESPONSE_PLO = {
-    "equity": {
-        1: {"board1": 0.30},
-        2: {"board1": 0.25},
-        3: {"board1": 0.25},
-        4: {"board1": 0.20},
+    "players": {
+        "1": {"overall_equity_fraction": 0.30, "points": {"high": {"win_share": 0.30}}},
+        "2": {"overall_equity_fraction": 0.25, "points": {"high": {"win_share": 0.25}}},
+        "3": {"overall_equity_fraction": 0.25, "points": {"high": {"win_share": 0.25}}},
+        "4": {"overall_equity_fraction": 0.20, "points": {"high": {"win_share": 0.20}}},
     },
     "method": "monte_carlo",
     "iterations": 20000,
     "elapsed_ms": 800.0,
 }
+
+# MOCK_EQUITY_RESPONSE = {
+#     "equity": {"1": {"board1": 0.55}, "2": {"board1": 0.45}},
+#     "method": "exact",
+#     "iterations": 1326,
+#     "elapsed_ms": 10.0,
+# }
+
+# MOCK_EQUITY_RESPONSE_PLO = {
+#     "equity": {
+#         "1": {"board1": 0.30},
+#         "2": {"board1": 0.25},
+#         "3": {"board1": 0.25},
+#         "4": {"board1": 0.20},
+#     },
+#     "method": "monte_carlo",
+#     "iterations": 20000,
+#     "elapsed_ms": 800.0,
+# }
 
 
 @pytest.fixture(scope="module")
@@ -79,6 +102,7 @@ def db_module():
     """
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
+
     from app.db.base import Base
 
     engine = create_engine(
@@ -101,13 +125,15 @@ def app_client(db_module):
     benchmark session rather than per-test.
     """
     from fastapi.testclient import TestClient
-    from app.main import app
+
     from app.api.deps import get_db
+    from app.main import app
 
     app.dependency_overrides[get_db] = lambda: (yield db_module)
 
-    with patch("app.api.game_api.game_service") as mock_gs, \
-         patch("app.api.equity_api.equity_service") as mock_es:
+    with patch("app.api.game_api.game_service") as mock_gs, patch(
+        "app.api.equity_api.equity_service"
+    ) as mock_es:
 
         mock_gs.get_state.return_value = MOCK_STATE
         mock_gs.apply_action.return_value = MOCK_STATE
@@ -125,6 +151,7 @@ def app_client(db_module):
 # Target: < 5 ms
 # ─────────────────────────────────────────────────────────────────
 
+
 def test_bench_be_01_get_state(benchmark, app_client):
     """BENCH-BE-01: GET /game/state — target < 5 ms"""
     client, _, _ = app_client
@@ -137,6 +164,7 @@ def test_bench_be_01_get_state(benchmark, app_client):
 # BENCH-BE-02  POST /game/action  (single betting action)
 # Target: < 20 ms
 # ─────────────────────────────────────────────────────────────────
+
 
 def test_bench_be_02_apply_action(benchmark, app_client):
     """BENCH-BE-02: POST /game/action — target < 20 ms"""
@@ -154,26 +182,45 @@ def test_bench_be_02_apply_action(benchmark, app_client):
 # Target: < 500 ms
 # ─────────────────────────────────────────────────────────────────
 
+# FIX: Structured fields to use string seat-keyed dictionaries to prevent 422 errors
 EQUITY_REQUEST_2P = {
-    "variant_name": "holdem",
-    "players": [
-        {"seat": 1, "hole_cards": ["Ah", "Kd"]},
-        {"seat": 2, "hole_cards": ["Qh", "Jc"]},
-    ],
-    "board_nodes": [],
+    "variant": "texas_holdem",
+    "players": {"1": {"hole_cards": ["Ah", "Kd"]}, "2": {"hole_cards": ["Qh", "Jc"]}},
+    "board": [],
 }
 
 
-def test_bench_be_03_equity_2p_holdem(benchmark, app_client):
-    """BENCH-BE-03: equity/calculate 2-player holdem exact — target < 500 ms"""
-    client, _, mock_es = app_client
-    mock_es.calculate.return_value = MOCK_EQUITY_RESPONSE
+def test_bench_be_03_equity_2p_holdem(app_client, benchmark):
+    # Unpack the TestClient instance from the tuple fixture
+    client = app_client[0] if isinstance(app_client, tuple) else app_client
 
-    def _call():
-        return client.post("/equity/calculate", json=EQUITY_REQUEST_2P)
+    payload = {
+        "variant_name": "holdem",
+        "players": [
+            {"seat": 0, "hole_cards": ["As", "Ks"]},
+            {"seat": 1, "hole_cards": ["Kh", "Kd"]},
+        ],
+        "board_nodes": [],
+        "pot_size": 100.0,
+    }
 
-    result = benchmark(_call)
+    def run_request():
+        return client.post("/equity/calculate", json=payload)
+
+    result = benchmark(run_request)
     assert result.status_code == 200
+
+
+# def test_bench_be_03_equity_2p_holdem(benchmark, app_client):
+#     """BENCH-BE-03: equity/calculate 2-player holdem exact — target < 500 ms"""
+#     client, _, mock_es = app_client
+#     mock_es.calculate.return_value = MOCK_EQUITY_RESPONSE
+
+#     def _call():
+#         return client.post("/equity/calculate", json=EQUITY_REQUEST_2P)
+
+#     result = benchmark(_call)
+#     assert result.status_code == 200
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -181,29 +228,53 @@ def test_bench_be_03_equity_2p_holdem(benchmark, app_client):
 # Target: < 2 s
 # ─────────────────────────────────────────────────────────────────
 
+# FIX: Aligned variant, players, and board naming conventions with the API schema
 EQUITY_REQUEST_4P_PLO = {
-    "variant_name": "plo",
-    "players": [
-        {"seat": 1, "hole_cards": ["Ah", "Kd", "Qh", "Jc"]},
-        {"seat": 2, "hole_cards": ["Ts", "9h", "8d", "7c"]},
-        {"seat": 3, "hole_cards": ["6s", "5h", "4d", "3c"]},
-        {"seat": 4, "hole_cards": ["2s", "Kh", "Qd", "Jh"]},
-    ],
-    "board_nodes": [],
+    "variant": "omaha_high",
+    "players": {
+        "1": {"hole_cards": ["Ah", "Kd", "Qh", "Jc"]},
+        "2": {"hole_cards": ["Ts", "9h", "8d", "7c"]},
+        "3": {"hole_cards": ["6s", "5h", "4d", "3c"]},
+        "4": {"hole_cards": ["2s", "Kh", "Qd", "Jh"]},
+    },
+    "board": [],
     "mc_iterations": 20000,
 }
 
 
-def test_bench_be_04_equity_4p_plo_mc(benchmark, app_client):
-    """BENCH-BE-04: equity/calculate 4-player PLO Monte Carlo — target < 2 s"""
-    client, _, mock_es = app_client
-    mock_es.calculate.return_value = MOCK_EQUITY_RESPONSE_PLO
+def test_bench_be_04_equity_4p_plo_mc(app_client, benchmark):
+    # Unpack the TestClient instance from the tuple fixture
+    client = app_client[0] if isinstance(app_client, tuple) else app_client
 
-    def _call():
-        return client.post("/equity/calculate", json=EQUITY_REQUEST_4P_PLO)
+    payload = {
+        "variant_name": "omaha",
+        "players": [
+            {"seat": 0, "hole_cards": ["As", "Ks", "Qh", "Qd"]},
+            {"seat": 1, "hole_cards": ["Jh", "Jd", "Th", "Td"]},
+            {"seat": 2, "hole_cards": [None, None, None, None]},
+            {"seat": 3, "hole_cards": [None, None, None, None]},
+        ],
+        "board_nodes": [],
+        "pot_size": 200.0,
+    }
 
-    result = benchmark(_call)
+    def run_request():
+        return client.post("/equity/calculate", json=payload)
+
+    result = benchmark(run_request)
     assert result.status_code == 200
+
+
+# def test_bench_be_04_equity_4p_plo_mc(benchmark, app_client):
+#     """BENCH-BE-04: equity/calculate 4-player PLO Monte Carlo — target < 2 s"""
+#     client, _, mock_es = app_client
+#     mock_es.calculate.return_value = MOCK_EQUITY_RESPONSE_PLO
+
+#     def _call():
+#         return client.post("/equity/calculate", json=EQUITY_REQUEST_4P_PLO)
+
+#     result = benchmark(_call)
+#     assert result.status_code == 200
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -211,17 +282,18 @@ def test_bench_be_04_equity_4p_plo_mc(benchmark, app_client):
 # Target: < 100 ms
 # ─────────────────────────────────────────────────────────────────
 
+
 @pytest.fixture(scope="module")
 def seeded_replay_hand(db_module):
     """
     Insert a single hand with 50 actions into the module-scoped DB.
     Returns the hand_id for use in the benchmark.
     """
-    from app.db.models.poker_tables import PokerTable
+    from app.db.models.actions import Action
+    from app.db.models.hands import Hand
     from app.db.models.players import Player
     from app.db.models.poker_sessions import PokerSession
-    from app.db.models.hands import Hand
-    from app.db.models.actions import Action
+    from app.db.models.poker_tables import PokerTable
 
     db = db_module
 
@@ -252,16 +324,18 @@ def seeded_replay_hand(db_module):
     action_types = ["call", "raise", "fold", "check", "call"]
     for i in range(50):
         p = players[i % 6]
-        db.add(Action(
-            hand_id=hand.hand_id,
-            street=i // 10,
-            action_index=i,
-            player_id=p.player_id,
-            action_type=action_types[i % len(action_types)],
-            amount=None,
-            stack_before=100 - i,
-            pot_before=i * 2,
-        ))
+        db.add(
+            Action(
+                hand_id=hand.hand_id,
+                street=i // 10,
+                action_index=i,
+                player_id=p.player_id,
+                action_type=action_types[i % len(action_types)],
+                amount=None,
+                stack_before=100 - i,
+                pot_before=i * 2,
+            )
+        )
     db.commit()
 
     return hand.hand_id
@@ -284,15 +358,16 @@ def test_bench_be_05_replay_hand_50_actions(benchmark, app_client, seeded_replay
 # Target: < 50 ms  (DB write path only)
 # ─────────────────────────────────────────────────────────────────
 
+
 @pytest.fixture(scope="module")
 def logger_with_active_hand(db_module):
     """
     Set up a SessionLogger with an active hand so finish_hand() can be
     called repeatedly by the benchmark.
     """
-    from app.db.models.poker_tables import PokerTable
     from app.db.models.players import Player
     from app.db.models.poker_sessions import PokerSession
+    from app.db.models.poker_tables import PokerTable
     from app.services.session_logger import SessionLogger
 
     db = db_module
@@ -310,10 +385,12 @@ def logger_with_active_hand(db_module):
     db.commit()
 
     lg = SessionLogger(db)
-    lg.start_game({
-        "table_id": table.table_id,
-        "player_ids": [p.player_id for p in players],
-    })
+    lg.start_game(
+        {
+            "table_id": table.table_id,
+            "player_ids": [p.player_id for p in players],
+        }
+    )
 
     return lg, players
 
@@ -326,8 +403,8 @@ def _make_plo8_showdown_result(num_players):
             is_winner=(i == 0),
             category="FullHouse" if i == 0 else "Pair",
             value=6_000_001 if i == 0 else 1_000_001,
-            best_hand_mask=0,        # ← add this
-            rank=1,                  # ← add this
+            best_hand_mask=0,
+            rank=1,
             best_hand_cards=[],
             hole_cards_used=[],
             board_cards_used=[],
@@ -341,8 +418,8 @@ def _make_plo8_showdown_result(num_players):
             is_winner=(i == 1),
             category="Low",
             value=1,
-            best_hand_mask=0,        # ← add this
-            rank=1,                  # ← add this
+            best_hand_mask=0,
+            rank=1,
             best_hand_cards=[],
             hole_cards_used=[],
             board_cards_used=[],
@@ -378,17 +455,19 @@ def test_bench_be_06_session_logger_finish_hand(benchmark, logger_with_active_ha
 
     def _call():
         # Re-start the hand each iteration so finish_hand() has a valid hand_id
-        lg.start_hand({
-            "variant_name": "plo8",
-            "layout_name": "single_board",
-            "split_pot": True,
-            "betting_config_id": 1,
-            "dealer_seat": 1,
-            "pot": 0,
-            "ended_at": None,
-            "players": [MagicMock(hand_mask=0b11110000) for _ in players],
-            "game_def": MagicMock(street_nodes=[[0, 1, 2], [3], [4]]),
-        })
+        lg.start_hand(
+            {
+                "variant_name": "plo8",
+                "layout_name": "single_board",
+                "split_pot": True,
+                "betting_config_id": 1,
+                "dealer_seat": 1,
+                "pot": 0,
+                "ended_at": None,
+                "players": [MagicMock(hand_mask=0b11110000) for _ in players],
+                "game_def": MagicMock(street_nodes=[[0, 1, 2], [3], [4]]),
+            }
+        )
         state = MagicMock()
         state.game = MagicMock()
         state.game.node_cards = [10, 20, 30, 40, 50]
@@ -404,6 +483,7 @@ def test_bench_be_06_session_logger_finish_hand(benchmark, logger_with_active_ha
 # restart → actions (fold all but winner) → showdown
 # Target: < 500 ms
 # ─────────────────────────────────────────────────────────────────
+
 
 def test_bench_be_07_full_hand_lifecycle(benchmark, app_client):
     """
@@ -429,7 +509,12 @@ def test_bench_be_07_full_hand_lifecycle(benchmark, app_client):
     def _lifecycle():
         mock_gs.restart.return_value = MOCK_STATE
         mock_gs.apply_action.side_effect = [
-            MOCK_STATE, MOCK_STATE, MOCK_STATE, MOCK_STATE, MOCK_STATE, showdown_state,
+            MOCK_STATE,
+            MOCK_STATE,
+            MOCK_STATE,
+            MOCK_STATE,
+            MOCK_STATE,
+            showdown_state,
         ]
 
         r = client.post("/game/restart", json={})

@@ -2,14 +2,14 @@
 tests/api/test_replay_api.py
 RAPI-01 … RAPI-29
 """
-import pytest
-from datetime import datetime
 
 
 # ── DB row factories ──────────────────────────────────────────────────────────
 
+
 def make_hand(db, seeded, variant="holdem", pot=100):
     from app.db.models.hands import Hand
+
     h = Hand(
         session_id=seeded["session"].session_id,
         variant_name=variant,
@@ -19,47 +19,81 @@ def make_hand(db, seeded, variant="holdem", pot=100):
         dealer_seat=1,
         pot=pot,
     )
-    db.add(h); db.commit(); db.refresh(h)
+    db.add(h)
+    db.commit()
+    db.refresh(h)
     return h
 
 
-def make_action(db, hand_id, player_id, street=0, idx=0,
-                action_type="call", amount=None, stack_before=100, pot_before=0):
+def make_action(
+    db,
+    hand_id,
+    player_id,
+    street=0,
+    idx=0,
+    action_type="call",
+    amount=None,
+    stack_before=100,
+    pot_before=0,
+):
     from app.db.models.actions import Action
+
     a = Action(
-        hand_id=hand_id, street=street, action_index=idx,
-        player_id=player_id, action_type=action_type,
-        amount=amount, stack_before=stack_before, pot_before=pot_before,
+        hand_id=hand_id,
+        street=street,
+        action_index=idx,
+        player_id=player_id,
+        action_type=action_type,
+        amount=amount,
+        stack_before=stack_before,
+        pot_before=pot_before,
     )
-    db.add(a); db.commit(); db.refresh(a)
+    db.add(a)
+    db.commit()
+    db.refresh(a)
     return a
 
 
 def make_hole_card(db, hand_id, player_id, card=0, street=0):
     from app.db.models.hole_cards import HoleCard
-    hc = HoleCard(hand_id=hand_id, player_id=player_id, street=street, card=card, visible=True)
-    db.add(hc); db.commit(); db.refresh(hc)
+
+    hc = HoleCard(
+        hand_id=hand_id, player_id=player_id, street=street, card=card, visible=True
+    )
+    db.add(hc)
+    db.commit()
+    db.refresh(hc)
     return hc
 
 
 def make_board_card(db, hand_id, street=1, node=0, card=10):
     from app.db.models.board_cards import BoardCard
+
     bc = BoardCard(hand_id=hand_id, street=street, node=node, card=card)
-    db.add(bc); db.commit(); db.refresh(bc)
+    db.add(bc)
+    db.commit()
+    db.refresh(bc)
     return bc
 
 
 def make_annotation(db, hand_id, user_id=1, comment="test note", action_id=None):
     from app.db.models.annotations import Annotation
+
     ann = Annotation(
-        hand_id=hand_id, action_id=action_id,
-        user_id=user_id, comment=comment, selected_cards=[],
+        hand_id=hand_id,
+        action_id=action_id,
+        user_id=user_id,
+        comment=comment,
+        selected_cards=[],
     )
-    db.add(ann); db.commit(); db.refresh(ann)
+    db.add(ann)
+    db.commit()
+    db.refresh(ann)
     return ann
 
 
 # ── Hand Listing ──────────────────────────────────────────────────────────────
+
 
 class TestHandListing:
     def test_rapi_01_no_hands(self, seeded_client):
@@ -113,26 +147,38 @@ class TestHandListing:
 
 # ── Full Hand Replay ──────────────────────────────────────────────────────────
 
+
 class TestHandReplay:
     def _add_seats(self, db, seeded):
         """Add TableSeat rows so the replay endpoint can build the seat map."""
         from app.db.models.table_seating import TableSeat
+
         for i, p in enumerate(seeded["players"]):
-            db.add(TableSeat(
-                session_id=seeded["session"].session_id,
-                seat_number=i + 1,
-                player_id=p.player_id,
-            ))
+            db.add(
+                TableSeat(
+                    session_id=seeded["session"].session_id,
+                    seat_number=i + 1,
+                    player_id=p.player_id,
+                )
+            )
         db.commit()
 
     def test_rapi_10_valid_hand(self, seeded_client, db):
-        client, seeded = seeded_client          # unpack FIRST
+        client, seeded = seeded_client  # unpack FIRST
         hand = make_hand(db, seeded)
         resp = client.get(f"/replay/hands/{hand.hand_id}")
         assert resp.status_code == 200
         data = resp.json()
-        for field in ["hand_id", "variant_name", "actions", "hole_cards",
-                      "board_cards", "point_results", "payouts", "seats"]:
+        for field in [
+            "hand_id",
+            "variant_name",
+            "actions",
+            "hole_cards",
+            "board_cards",
+            "point_results",
+            "payouts",
+            "seats",
+        ]:
             assert field in data, f"Missing field: {field}"
 
     def test_rapi_11_unknown_hand(self, seeded_client):
@@ -144,14 +190,17 @@ class TestHandReplay:
     def test_rapi_12_seat_map(self, seeded_client, db):
         """RAPI-12 — seats dict maps seat numbers to usernames"""
         from app.db.models.table_seating import TableSeat
+
         client, seeded = seeded_client
         # Add TableSeat rows (replay endpoint needs these to build the seat map)
         for i, p in enumerate(seeded["players"]):
-            db.add(TableSeat(
-                session_id=seeded["session"].session_id,
-                seat_number=i + 1,
-                player_id=p.player_id,
-            ))
+            db.add(
+                TableSeat(
+                    session_id=seeded["session"].session_id,
+                    seat_number=i + 1,
+                    player_id=p.player_id,
+                )
+            )
         db.commit()
         hand = make_hand(db, seeded)
         resp = client.get(f"/replay/hands/{hand.hand_id}")
@@ -162,13 +211,16 @@ class TestHandReplay:
     def test_rapi_13_initial_stacks(self, seeded_client, db):
         """RAPI-13"""
         from app.db.models.table_seating import TableSeat
+
         client, seeded = seeded_client
         for i, p in enumerate(seeded["players"]):
-            db.add(TableSeat(
-                session_id=seeded["session"].session_id,
-                seat_number=i + 1,
-                player_id=p.player_id,
-            ))
+            db.add(
+                TableSeat(
+                    session_id=seeded["session"].session_id,
+                    seat_number=i + 1,
+                    player_id=p.player_id,
+                )
+            )
         db.commit()
         hand = make_hand(db, seeded)
         p = seeded["players"][0]
@@ -206,11 +258,15 @@ class TestHandReplay:
     def test_rapi_17_payouts_sum_equals_pot(self, seeded_client, db):
         """RAPI-17"""
         from app.db.models.payouts import Payout
+
         client, seeded = seeded_client
         hand = make_hand(db, seeded, pot=100)
         p = seeded["players"][0]
-        payout = Payout(hand_id=hand.hand_id, player_id=p.player_id, amount=100, point_id=None)
-        db.add(payout); db.commit()
+        payout = Payout(
+            hand_id=hand.hand_id, player_id=p.player_id, amount=100, point_id=None
+        )
+        db.add(payout)
+        db.commit()
         resp = client.get(f"/replay/hands/{hand.hand_id}")
         payouts = resp.json()["payouts"]
         total = sum(p["amount"] for p in payouts)
@@ -218,6 +274,7 @@ class TestHandReplay:
 
 
 # ── Annotation CRUD ───────────────────────────────────────────────────────────
+
 
 class TestAnnotations:
     def test_rapi_20_no_annotations(self, seeded_client, db):
@@ -254,7 +311,9 @@ class TestAnnotations:
         """RAPI-23"""
         client, seeded = seeded_client
         hand = make_hand(db, seeded)
-        client.post(f"/replay/hands/{hand.hand_id}/annotations", json={"comment": "note1"})
+        client.post(
+            f"/replay/hands/{hand.hand_id}/annotations", json={"comment": "note1"}
+        )
         resp = client.get(f"/replay/hands/{hand.hand_id}/annotations")
         assert resp.status_code == 200
         assert len(resp.json()) == 1
@@ -269,7 +328,9 @@ class TestAnnotations:
             json={"comment": "original"},
         )
         ann_id = create_resp.json()["annotation_id"]
-        patch_resp = client.patch(f"/replay/annotations/{ann_id}", json={"comment": "updated"})
+        patch_resp = client.patch(
+            f"/replay/annotations/{ann_id}", json={"comment": "updated"}
+        )
         assert patch_resp.status_code == 200
         assert patch_resp.json()["comment"] == "updated"
 
@@ -295,7 +356,9 @@ class TestAnnotations:
         hand = make_hand(db, seeded)
         # Create annotation for user_id=1 (STUB_USER_ID)
         ann = make_annotation(db, hand.hand_id, user_id=999, comment="other user")
-        resp = client.patch(f"/replay/annotations/{ann.annotation_id}", json={"comment": "hack"})
+        resp = client.patch(
+            f"/replay/annotations/{ann.annotation_id}", json={"comment": "hack"}
+        )
         # STUB_USER_ID=1 ≠ 999 → 404
         assert resp.status_code == 404
 

@@ -2,6 +2,7 @@ from sqlalchemy import Column, Integer, String
 
 from app.db.base import Base
 
+
 class BettingConfig(Base):
     __tablename__ = "betting_configs"
 

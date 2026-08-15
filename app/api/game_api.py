@@ -1,11 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
-from app.services.session_logger import SessionLogger
 from app.services.game_service import game_service
-
 
 router = APIRouter(prefix="/game")
 
@@ -13,6 +11,7 @@ router = APIRouter(prefix="/game")
 # --------------------------------------------------
 # Request models
 # --------------------------------------------------
+
 
 class ActionRequest(BaseModel):
     type: str
@@ -35,10 +34,26 @@ class SelectGameRequest(BaseModel):
 # Routes
 # --------------------------------------------------
 
+
 @router.get("/variants")
 def get_variants():
-    """ Return all available game variants and the currently active one."""
+    """Return all available game variants and the currently active one."""
     return game_service.get_variants()
+
+
+@router.get("/variants/{game_name}/config")
+def get_variant_config(game_name: str):
+    """
+    Return the per-variant config block (board layout + creation phases)
+    that the Hand Creation wizard needs to drive its phase machine.
+    """
+    config = game_service.get_variant_config(game_name)
+    if config is None:
+        raise HTTPException(
+            status_code=404, detail=f"Unknown game variant: {game_name!r}"
+        )
+    return config
+
 
 @router.post("/select-game")
 def select_game(req: SelectGameRequest):
@@ -58,6 +73,7 @@ def new_hand(req: NewHandRequest = NewHandRequest()):
     print("New hand starting with game ", req.game_name)
     result = game_service.new_hand(game_name=req.game_name)
     return result
+
 
 @router.post("/restart")
 def restart(req: RestartRequest = RestartRequest(), db: Session = Depends(get_db)):
@@ -81,10 +97,3 @@ def apply_action(req: ActionRequest):
     dto_state = game_service.apply_action(req)
     # print("dto_state: ", dto_state)
     return dto_state
-
-@router.post("/start")
-def start_game(config: dict, db: Session = Depends(get_db)):
-    logger = GameLogger(db)
-    logger.start_game(config)
-
-    return {"status": "ok"}

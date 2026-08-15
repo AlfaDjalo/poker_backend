@@ -9,8 +9,6 @@ POST /game/edit/cancel  — cancel editing, restore pre-edit snapshot
 
 from __future__ import annotations
 
-from typing import List, Optional
-
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -23,30 +21,32 @@ router = APIRouter(prefix="/game/edit")
 
 # ── Request DTOs ──────────────────────────────────────────────────
 
+
 class PlayerEditInput(BaseModel):
-    seat: int                               # 1-based
+    seat: int  # 1-based
     stack: int
     current_bet: int
     total_contribution: int
     has_folded: bool
     is_all_in: bool
-    hole_cards: List[Optional[str]]
+    hole_cards: list[str | None]
 
 
 class EditStateRequest(BaseModel):
     game_name: str
     street_index: int
     pot: int
-    dealer_position: int                    # 0-based
-    current_player: int                     # 0-based engine index
+    dealer_position: int  # 0-based
+    current_player: int  # 0-based engine index
     bet_to_call: int
     min_raise: int
-    players: List[PlayerEditInput]
-    node_cards: List[Optional[str]]         # indexed by node position
-    discard_pile: List[str] = []
+    players: list[PlayerEditInput]
+    node_cards: list[str | None]  # indexed by node position
+    discard_pile: list[str] = []
 
 
 # ── Endpoints ─────────────────────────────────────────────────────
+
 
 @router.post("/begin")
 def begin_edit(db: Session = Depends(get_db)):
@@ -83,7 +83,7 @@ def load_edit(req: EditStateRequest):
     Load an arbitrary snapshot from the Hand Replayer.
     Reconstructs PokerState mid-hand so the Game Simulator can resume.
     Does NOT log the resulting hand to the database.
-    """    
+    """
     try:
         dto = game_service.load_edit(req)
     except ValueError as exc:

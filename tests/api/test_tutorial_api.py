@@ -15,19 +15,19 @@ If your local fix added `pot` to the request model already, TAPI-01
 will fail (no longer 500) — that's expected and is itself confirmation
 the fix landed; update/remove TAPI-01 at that point.
 """
+
 import pytest
 from fastapi.testclient import TestClient
 
-from app.main import app
 from app.api.deps import get_db
-from app.db.models.hands import Hand
-from app.db.models.players import Player
-from app.db.models.hole_cards import HoleCard
-from app.db.models.board_cards import BoardCard
 from app.db.models.actions import Action
-
+from app.db.models.board_cards import BoardCard
+from app.db.models.hands import Hand
+from app.db.models.hole_cards import HoleCard
+from app.main import app
 
 # ── Helpers ─────────────────────────────────────────────────────────
+
 
 def make_save_request(**overrides):
     base = {
@@ -54,8 +54,16 @@ def client(db):
     app.dependency_overrides.clear()
 
 
-def _insert_hand(db, *, is_hypothetical, variant_name="holdem", layout_name="single_board",
-                  pot=10, dealer_seat=1, session_id=None):
+def _insert_hand(
+    db,
+    *,
+    is_hypothetical,
+    variant_name="holdem",
+    layout_name="single_board",
+    pot=10,
+    dealer_seat=1,
+    session_id=None,
+):
     hand = Hand(
         session_id=session_id,
         variant_name=variant_name,
@@ -73,6 +81,7 @@ def _insert_hand(db, *, is_hypothetical, variant_name="holdem", layout_name="sin
 
 # ── 15.1 Save Hypothetical Hand ──────────────────────────────────────
 
+
 class TestSaveHypotheticalHand:
 
     # def test_TAPI_01_pot_attribute_bug(self, client, db):
@@ -82,7 +91,7 @@ class TestSaveHypotheticalHand:
     #     the request model (or the route stops referencing it).
     #     """
     #     from app.db.models.players import Player # Adjust import path to your Player model
-    
+
     #     if not db.query(Player).filter(Player.player_id == -1).first():
     #         db.add(Player(player_id=-1, username="Tutorial Dummy"))
     #         db.commit()
@@ -148,18 +157,28 @@ class TestSaveHypotheticalHand:
 
     # @pytest.mark.xfail(reason="BUG-BE-15 blocks all writes", strict=False)
     def test_TAPI_06_actions_resolved_via_seat_to_pid(self, client, db):
-        req = make_save_request(actions=[
-            {
-                "street": 0, "action_index": 0, "player_seat": 1,
-                "action_type": "CALL", "amount": 2,
-                "stack_before": 100, "pot_before": 0,
-            },
-            {
-                "street": 0, "action_index": 1, "player_seat": 2,
-                "action_type": "CHECK", "amount": None,
-                "stack_before": 98, "pot_before": 4,
-            },
-        ])
+        req = make_save_request(
+            actions=[
+                {
+                    "street": 0,
+                    "action_index": 0,
+                    "player_seat": 1,
+                    "action_type": "CALL",
+                    "amount": 2,
+                    "stack_before": 100,
+                    "pot_before": 0,
+                },
+                {
+                    "street": 0,
+                    "action_index": 1,
+                    "player_seat": 2,
+                    "action_type": "CHECK",
+                    "amount": None,
+                    "stack_before": 98,
+                    "pot_before": 4,
+                },
+            ]
+        )
         resp = client.post("/tutorial/hands", json=req)
         assert resp.status_code == 200
         hand_id = resp.json()["hand_id"]
@@ -177,13 +196,19 @@ class TestSaveHypotheticalHand:
     # @pytest.mark.xfail(reason="BUG-BE-15 blocks all writes", strict=False)
     def test_TAPI_06b_action_unknown_seat_falls_back(self, client, db):
         """player_seat not present in seat_to_pid falls back to -seat."""
-        req = make_save_request(actions=[
-            {
-                "street": 0, "action_index": 0, "player_seat": 9,
-                "action_type": "FOLD", "amount": None,
-                "stack_before": None, "pot_before": None,
-            },
-        ])
+        req = make_save_request(
+            actions=[
+                {
+                    "street": 0,
+                    "action_index": 0,
+                    "player_seat": 9,
+                    "action_type": "FOLD",
+                    "amount": None,
+                    "stack_before": None,
+                    "pot_before": None,
+                },
+            ]
+        )
         resp = client.post("/tutorial/hands", json=req)
         assert resp.status_code == 200
         hand_id = resp.json()["hand_id"]
@@ -199,16 +224,19 @@ class TestSaveHypotheticalHand:
         NOT from a real Player DB row (no such row exists for synthetic
         hypothetical-hand seats).
         """
-        req = make_save_request(players=[
-            {"seat": 1, "name": "Zara", "stack": 50, "hole_cards": ["Ah", None]},
-            {"seat": 2, "name": "Milo", "stack": 75, "hole_cards": [None, None]},
-        ])
+        req = make_save_request(
+            players=[
+                {"seat": 1, "name": "Zara", "stack": 50, "hole_cards": ["Ah", None]},
+                {"seat": 2, "name": "Milo", "stack": 75, "hole_cards": [None, None]},
+            ]
+        )
         resp = client.post("/tutorial/hands", json=req)
         assert resp.status_code == 200
         assert resp.json()["player_names"] == ["Zara", "Milo"]
 
 
 # ── 15.2 List Hypothetical Hands ─────────────────────────────────────
+
 
 class TestListHypotheticalHands:
 
@@ -258,6 +286,7 @@ class TestListHypotheticalHands:
 
 # ── 15.3 Fetch Single Hypothetical Hand ──────────────────────────────
 
+
 class TestGetHypotheticalHand:
 
     def test_TAPI_20_existing_hypothetical_hand_returns_full_dto(self, client, db):
@@ -269,9 +298,20 @@ class TestGetHypotheticalHand:
 
         # Shape matches HandReplayDTO (delegated to replay_api.get_hand)
         for key in (
-            "hand_id", "variant_name", "layout_name", "split_pot", "pot",
-            "dealer_seat", "started_at", "seats", "initial_stacks",
-            "actions", "hole_cards", "board_cards", "point_results", "payouts",
+            "hand_id",
+            "variant_name",
+            "layout_name",
+            "split_pot",
+            "pot",
+            "dealer_seat",
+            "started_at",
+            "seats",
+            "initial_stacks",
+            "actions",
+            "hole_cards",
+            "board_cards",
+            "point_results",
+            "payouts",
         ):
             assert key in body
         assert body["hand_id"] == hand.hand_id

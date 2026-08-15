@@ -1,7 +1,9 @@
-from cards.mask import mask_to_card_ids
+from poker_engine.cards.mask import mask_to_card_ids
+
 
 def mask_to_cards(mask):
     return list(mask_to_card_ids(mask))
+
 
 class BackendEngineCallbacks:
 
@@ -16,18 +18,20 @@ class BackendEngineCallbacks:
 
         if self._is_editing():
             return
-        
-        self.logger.start_hand({
-            "variant_name": state.game_def.game_name,
-            "layout_name": state.game_def.layout_name,
-            "split_pot": (state.rules.payout_type == "split_pot"),
-            "betting_config_id": 1,
-            "dealer_seat": state.game.dealer_position,
-            "pot": state.game.pot,
-            "ended_at": None,    
-            "players": state.game.players,
-            "game_def": state.game_def,      
-        })
+
+        self.logger.start_hand(
+            {
+                "variant_name": state.game_def.game_name,
+                "layout_name": state.game_def.layout_name,
+                "split_pot": (state.rules.payout_type == "split_pot"),
+                "betting_config_id": 1,
+                "dealer_seat": state.game.dealer_position,
+                "pot": state.game.pot,
+                "ended_at": None,
+                "players": state.game.players,
+                "game_def": state.game_def,
+            }
+        )
 
         # self.logger.start_hand({
         #     # "hand_number": self.hand_number,
@@ -38,13 +42,10 @@ class BackendEngineCallbacks:
 
         if self._is_editing():
             return
-        
+
         g = state.game
 
-        board = [
-            c for c in g.node_cards
-            if c is not None
-        ]
+        board = [c for c in g.node_cards if c is not None]
 
         stacks = [p.stack for p in g.players]
 
@@ -68,4 +69,3 @@ class BackendEngineCallbacks:
             return
 
         self.logger.finish_hand(state)
-

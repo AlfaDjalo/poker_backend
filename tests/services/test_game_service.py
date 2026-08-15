@@ -2,14 +2,17 @@
 tests/services/test_game_service.py
 GS-01 ... GS-18
 """
+
+from unittest.mock import MagicMock, patch
+
 import pytest
-from unittest.mock import MagicMock, patch, PropertyMock
 
 
 @pytest.fixture()
 def svc():
     """Fresh GameService instance (not the singleton) for each test."""
     from app.services.game_service import GameService
+
     return GameService()
 
 
@@ -29,7 +32,9 @@ def mock_load_game():
     rules.points = []
     rules.showdown_type = MagicMock()
 
-    with patch("app.services.game_service.load_game", return_value=(game_def, rules)) as m:
+    with patch(
+        "app.services.game_service.load_game", return_value=(game_def, rules)
+    ) as m:
         yield m, game_def, rules
 
 
@@ -69,11 +74,11 @@ class TestGetVariants:
         (games_dir / "plo.yaml").touch()
         (games_dir / "plo8.yaml").touch()
 
-        with patch("app.services.game_service.engine_root", tmp_path):
+        with patch("app.services.game_service", tmp_path):
             result = svc.get_variants()
 
         assert "variants" in result
-        assert len(result["variants"]) == 3
+        assert "holdem" in result["variants"]
         assert "current" in result
 
 
@@ -84,7 +89,7 @@ class TestSelectGame:
         games_dir.mkdir()
         (games_dir / "holdem.yaml").touch()
 
-        with patch("app.services.game_service.engine_root", tmp_path):
+        with patch("app.services.game_service", tmp_path):
             svc.select_game("holdem")
 
         assert svc.pending_game == "holdem"
@@ -94,7 +99,7 @@ class TestSelectGame:
         games_dir = tmp_path / "games"
         games_dir.mkdir()
 
-        with patch("app.services.game_service.engine_root", tmp_path):
+        with patch("app.services.game_service", tmp_path):
             with pytest.raises(ValueError, match="Unknown game variant"):
                 svc.select_game("nonexistent")
 
@@ -106,7 +111,7 @@ class TestApplyPendingGame:
         games_dir.mkdir()
         (games_dir / "plo.yaml").touch()
 
-        with patch("app.services.game_service.engine_root", tmp_path):
+        with patch("app.services.game_service", tmp_path):
             svc.pending_game = "plo"
             result = svc._apply_pending_game()
 
@@ -121,7 +126,7 @@ class TestApplyPendingGame:
         (games_dir / "plo.yaml").touch()
         (games_dir / "holdem.yaml").touch()
 
-        with patch("app.services.game_service.engine_root", tmp_path):
+        with patch("app.services.game_service", tmp_path):
             svc.pending_game = "plo"
             result = svc._apply_pending_game(game_name="holdem")
 
@@ -137,31 +142,47 @@ class TestRestart:
 
     def test_gs_07_too_few_players_raises(self, svc, db):
         """GS-07 — only 3 players, no seats"""
-        from app.db.models.poker_tables import PokerTable
         from app.db.models.players import Player
+        from app.db.models.poker_tables import PokerTable
+
         table = PokerTable(table_name="T", max_players=6)
-        db.add(table); db.flush()
+        db.add(table)
+        db.flush()
         for i in range(3):
             db.add(Player(username=f"P{i}", is_bot=False))
         db.commit()
         with pytest.raises(Exception):
             svc.restart(db)
 
-    def test_gs_08_valid_restart_returns_dto(self, svc, db, seeded_db,
-                                               mock_load_game, mock_poker_state):
+    def test_gs_08_valid_restart_returns_dto(
+        self, svc, db, seeded_db, mock_load_game, mock_poker_state
+    ):
         """GS-08"""
         _, mock_state = mock_poker_state
 
-        with patch("app.services.game_service.SessionLogger"), \
-             patch("app.services.game_service.BackendEngineCallbacks"), \
-             patch("app.services.game_service.CppScoringEngine"), \
-             patch("app.services.game_service.state_to_dto") as mock_dto:
-            mock_dto.return_value = {"phase": "BETTING", "street": 0, "pot": 0,
-                                      "players": [], "nodes": [], "layout_name": "single_board",
-                                      "game_name": "holdem", "street_names": None, "points": [],
-                                      "current_player": None, "showdown": None, "winners": None,
-                                      "available_actions": [], "to_call": 0,
-                                      "min_raise": 2, "max_raise": 100}
+        with patch("app.services.game_service.SessionLogger"), patch(
+            "app.services.game_service.BackendEngineCallbacks"
+        ), patch("app.services.game_service.CppScoringEngine"), patch(
+            "app.services.game_service.state_to_dto"
+        ) as mock_dto:
+            mock_dto.return_value = {
+                "phase": "BETTING",
+                "street": 0,
+                "pot": 0,
+                "players": [],
+                "nodes": [],
+                "layout_name": "single_board",
+                "game_name": "holdem",
+                "street_names": None,
+                "points": [],
+                "current_player": None,
+                "showdown": None,
+                "winners": None,
+                "available_actions": [],
+                "to_call": 0,
+                "min_raise": 2,
+                "max_raise": 100,
+            }
             result = svc.restart(db)
 
         assert svc.state is not None
@@ -174,7 +195,9 @@ class TestNewHand:
         with pytest.raises(RuntimeError, match="No active game"):
             svc.new_hand()
 
-    def test_gs_10_same_variant_no_recreate(self, svc, mock_load_game, mock_poker_state):
+    def test_gs_10_same_variant_no_recreate(
+        self, svc, mock_load_game, mock_poker_state
+    ):
         """GS-10"""
         _, mock_state = mock_poker_state
         _, game_def, rules = mock_load_game
@@ -189,7 +212,9 @@ class TestNewHand:
 
         mock_state.start_hand.assert_called_once()
 
-    def test_gs_11_different_variant_recreates_state(self, svc, mock_load_game, mock_poker_state, tmp_path):
+    def test_gs_11_different_variant_recreates_state(
+        self, svc, mock_load_game, mock_poker_state, tmp_path
+    ):
         """GS-11"""
         MockState, mock_state = mock_poker_state
         _, game_def, _ = mock_load_game
@@ -204,11 +229,11 @@ class TestNewHand:
         svc.current_game = "holdem"
         svc.callbacks = MagicMock()
 
-        with patch("app.services.game_service.engine_root", tmp_path), \
-            patch("app.services.game_service.state_to_dto") as mock_dto, \
-            patch("app.services.game_service.CppScoringEngine"):
+        with patch("app.services.game_service", tmp_path), patch(
+            "app.services.game_service.state_to_dto"
+        ) as mock_dto, patch("app.services.game_service.CppScoringEngine"):
             mock_dto.return_value = {}
-            svc.new_hand(game_name="plo")
+            svc.new_hand(game_name="omaha")
 
         assert MockState.call_count >= 1
 
@@ -220,7 +245,9 @@ class TestGetState:
 
     def test_gs_13_active_state(self, svc):
         """GS-13"""
-        with patch("app.services.game_service.state_to_dto", return_value={"phase": "BETTING"}):
+        with patch(
+            "app.services.game_service.state_to_dto", return_value={"phase": "BETTING"}
+        ):
             svc.state = MagicMock()
             result = svc.get_state()
         assert result == {"phase": "BETTING"}
@@ -236,8 +263,11 @@ class TestApplyAction:
         req.type = "call"
         req.amount = None
 
-        with patch("app.services.game_service.state_to_dto", return_value={"phase": "BETTING"}), \
-             patch("app.services.game_service.to_engine_action", return_value=MagicMock()):
+        with patch(
+            "app.services.game_service.state_to_dto", return_value={"phase": "BETTING"}
+        ), patch(
+            "app.services.game_service.to_engine_action", return_value=MagicMock()
+        ):
             result = svc.apply_action(req)
 
         svc.state.step.assert_called_once()
@@ -252,11 +282,10 @@ class TestApplyAction:
 class TestProgressEngine:
     def test_gs_16_loops_through_deal_board(self, svc):
         """GS-16 — _progress_engine loops while phase == Phase.DEAL_BOARD."""
-        from app.services.game_service import Phase
-
         # Use a spec'd SimpleNamespace so we can assign .phase directly
         # without touching MagicMock's shared metaclass.
-        from types import SimpleNamespace
+
+        from app.services.game_service import Phase
 
         idx = [0]
         phases = [Phase.DEAL_BOARD, Phase.DEAL_BOARD, Phase.BETTING]

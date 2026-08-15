@@ -5,16 +5,14 @@ Tests for engine_adapter.state_to_dto and build_showdown_dto.
 Uses minimal mock PokerState objects (SimpleNamespace) — no real engine needed.
 """
 
-import pytest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
-from app.engine_adapter import state_to_dto, build_showdown_dto, card_to_str
-
+from app.engine_adapter import build_showdown_dto, card_to_str, state_to_dto
 
 # ─────────────────────────────────────────────────────────────────
 # Helpers / factories
 # ─────────────────────────────────────────────────────────────────
+
 
 def make_player(stack=100, current_bet=0, has_folded=False, hand_mask=0):
     return SimpleNamespace(
@@ -57,7 +55,7 @@ def make_game(
         action_objs = [SimpleNamespace(name=a) for a in legal_actions_list]
         g.legal_actions = lambda: action_objs
     else:
-        g.legal_actions = lambda: []
+        g.legal_actions = list
     return g
 
 
@@ -115,6 +113,7 @@ def make_poker_state(
 # ADP-30 / ADP-31 — card_to_str
 # ─────────────────────────────────────────────────────────────────
 
+
 class TestCardToStr:
     def test_adp30_none_returns_none(self):
         """ADP-30: card_id=None → None"""
@@ -130,6 +129,7 @@ class TestCardToStr:
 # ─────────────────────────────────────────────────────────────────
 # ADP-01 – ADP-10 — state_to_dto
 # ─────────────────────────────────────────────────────────────────
+
 
 class TestStateToDtoNodes:
     def test_adp01_all_none_node_cards(self):
@@ -200,7 +200,12 @@ class TestStateToDtoBettingPhase:
         """ADP-06: if computed to_call < 0, clamped to 0"""
         # bet_to_call=0, player.current_bet=5 → to_call = -5 → clamped to 0
         player = make_player(current_bet=5)
-        game = make_game(players=[player], current_player=0, bet_to_call=0, legal_actions_list=["check"])
+        game = make_game(
+            players=[player],
+            current_player=0,
+            bet_to_call=0,
+            legal_actions_list=["check"],
+        )
         state = make_poker_state(phase_name="BETTING", players=[player])
         state.game = game
         dto = state_to_dto(state)
@@ -210,7 +215,7 @@ class TestStateToDtoBettingPhase:
 class TestStateToDtoShowdown:
     def test_adp07_showdown_not_none(self):
         """ADP-07: last_showdown is not None → showdown is ShowdownDTO"""
-        from app.dto.state_dto import ShowdownDTO
+
         showdown_result = _make_showdown_result()
         state = make_poker_state(phase_name="SHOWDOWN", last_showdown=showdown_result)
         dto = state_to_dto(state)
@@ -244,7 +249,16 @@ class TestStateToDtoPoints:
 # ADP-20 – ADP-27 — build_showdown_dto
 # ─────────────────────────────────────────────────────────────────
 
-def _make_player_result(player_index=0, is_winner=True, category="Pair", value=1500000, best_hand=None, hole_used=None, board_used=None):
+
+def _make_player_result(
+    player_index=0,
+    is_winner=True,
+    category="Pair",
+    value=1500000,
+    best_hand=None,
+    hole_used=None,
+    board_used=None,
+):
     return SimpleNamespace(
         player_index=player_index,
         is_winner=is_winner,
@@ -256,17 +270,30 @@ def _make_player_result(player_index=0, is_winner=True, category="Pair", value=1
     )
 
 
-def _make_point_obj(name="board1", score_type_name="HIGH", showdown_type_val=0, results=None, node_mask=0b111):
+def _make_point_obj(
+    name="board1",
+    score_type_name="HIGH",
+    showdown_type_val=0,
+    results=None,
+    node_mask=0b111,
+):
     return SimpleNamespace(
         name=name,
         score_type=SimpleNamespace(name=score_type_name),
         showdown_type=SimpleNamespace(name="HOLDEM"),
-        results=results or [_make_player_result(0, True), _make_player_result(1, False)],
+        results=results
+        or [_make_player_result(0, True), _make_player_result(1, False)],
         node_mask=node_mask,
     )
 
 
-def _make_showdown_result(points=None, payouts=None, payout_type="split_pot", point_tallies=None, scoop_flags=None):
+def _make_showdown_result(
+    points=None,
+    payouts=None,
+    payout_type="split_pot",
+    point_tallies=None,
+    scoop_flags=None,
+):
     return SimpleNamespace(
         points=points or [_make_point_obj()],
         payouts=payouts or {0: 100, 1: 0},
@@ -284,10 +311,14 @@ class TestBuildShowdownDto:
     def test_adp21_single_point_single_board_one_winner(self):
         """ADP-21: single point, single board, player 0 wins"""
         result = _make_showdown_result(
-            points=[_make_point_obj(results=[
-                _make_player_result(0, True),
-                _make_player_result(1, False),
-            ])]
+            points=[
+                _make_point_obj(
+                    results=[
+                        _make_player_result(0, True),
+                        _make_player_result(1, False),
+                    ]
+                )
+            ]
         )
         rules = make_rules()
         dto = build_showdown_dto(result, rules, [0, 1])
@@ -305,10 +336,12 @@ class TestBuildShowdownDto:
 
     def test_adp23_no_qualify_when_no_winners(self):
         """ADP-23: no winners → no_qualify[0] == True"""
-        point = _make_point_obj(results=[
-            _make_player_result(0, False),
-            _make_player_result(1, False),
-        ])
+        point = _make_point_obj(
+            results=[
+                _make_player_result(0, False),
+                _make_player_result(1, False),
+            ]
+        )
         result = _make_showdown_result(points=[point])
         rules = make_rules()
         dto = build_showdown_dto(result, rules, [0, 1])
@@ -339,9 +372,13 @@ class TestBuildShowdownDto:
     def test_adp27_best_hand_cards_are_strings(self):
         """ADP-27: best_hand_cards mapped via card_to_str, not raw ints"""
         result = _make_showdown_result(
-            points=[_make_point_obj(results=[
-                _make_player_result(0, True, best_hand=[0, 1, 2, 3, 4]),
-            ])]
+            points=[
+                _make_point_obj(
+                    results=[
+                        _make_player_result(0, True, best_hand=[0, 1, 2, 3, 4]),
+                    ]
+                )
+            ]
         )
         rules = make_rules()
         dto = build_showdown_dto(result, rules, [0])

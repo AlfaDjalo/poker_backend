@@ -6,13 +6,14 @@ tests. We patch the singleton's bound methods directly rather than the
 class, since edit_api.py imports `game_service` (the instance) at module
 load time.
 """
+
 import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
 from app.services.game_service import game_service
-
 from tests.conftest import make_edit_state_request
+
 
 @pytest.fixture()
 def client():
@@ -24,12 +25,14 @@ def client():
 # 14.1 — /game/edit/begin
 # ─────────────────────────────────────────────
 
+
 class TestBeginEdit:
 
     def test_no_active_game_raises_400(self, client, monkeypatch):
         # EDAPI-01
         def fake_begin_edit(db):
             raise RuntimeError("No active game state.")
+
         monkeypatch.setattr(game_service, "begin_edit", fake_begin_edit)
 
         resp = client.post("/game/edit/begin")
@@ -87,6 +90,7 @@ class TestBeginEdit:
 # 14.2 — /game/edit/apply
 # ─────────────────────────────────────────────
 
+
 class TestApplyEdit:
 
     def test_valid_request_returns_game_state_shape(self, client, monkeypatch):
@@ -132,7 +136,9 @@ class TestApplyEdit:
         assert resp.status_code == 422
         assert "Duplicate card" in resp.json()["detail"]
 
-    def test_duplicate_card_between_player_and_node_cards_returns_422(self, client, monkeypatch):
+    def test_duplicate_card_between_player_and_node_cards_returns_422(
+        self, client, monkeypatch
+    ):
         # EDAPI-13
         def fake_apply_edit(req):
             raise ValueError("Duplicate card: 'Ah'")
@@ -147,7 +153,9 @@ class TestApplyEdit:
         assert resp.status_code == 422
         assert "Duplicate card" in resp.json()["detail"]
 
-    def test_duplicate_card_between_node_cards_and_discard_returns_422(self, client, monkeypatch):
+    def test_duplicate_card_between_node_cards_and_discard_returns_422(
+        self, client, monkeypatch
+    ):
         # EDAPI-14
         def fake_apply_edit(req):
             raise ValueError("Duplicate card: '7s'")
@@ -209,7 +217,7 @@ class TestApplyEdit:
         # EDAPI-18 — verified via real GameService instance, not a stub,
         # since this asserts internal state after the call completes.
         from app.services.game_service import GameService
-        from tests.conftest import FakePokerState, FakeLogger
+        from tests.conftest import FakeLogger, FakePokerState
 
         svc = GameService()
 
@@ -217,14 +225,19 @@ class TestApplyEdit:
             "app.services.game_service.load_game",
             lambda name: (
                 __import__("types").SimpleNamespace(
-                    game_name=name, hole_cards=2, node_count=5, layout_name="single_board"
+                    game_name=name,
+                    hole_cards=2,
+                    node_count=5,
+                    layout_name="single_board",
                 ),
                 __import__("types").SimpleNamespace(points=[], showdown_type=0),
             ),
         )
 
         svc.state = FakePokerState()
-        svc.state.game_def = __import__("types").SimpleNamespace(game_name="holdem", layout_name="single_board")
+        svc.state.game_def = __import__("types").SimpleNamespace(
+            game_name="holdem", layout_name="single_board"
+        )
         svc.logger = FakeLogger()
         svc.callbacks = None
         svc.editing_mode = True
@@ -242,7 +255,7 @@ class TestApplyEdit:
     def test_valid_request_passes_through_progress_engine(self, client, monkeypatch):
         # EDAPI-19
         from app.services.game_service import GameService
-        from tests.conftest import FakePokerState, FakeLogger
+        from tests.conftest import FakeLogger, FakePokerState
 
         svc = GameService()
         svc.state = FakePokerState()
@@ -270,6 +283,7 @@ class TestApplyEdit:
 # ─────────────────────────────────────────────
 # 14.3 — /game/edit/load
 # ─────────────────────────────────────────────
+
 
 class TestLoadEdit:
 
@@ -320,15 +334,21 @@ class TestLoadEdit:
             "app.services.game_service.load_game",
             lambda name: (
                 __import__("types").SimpleNamespace(
-                    game_name=name, hole_cards=2, node_count=5, layout_name="single_board"
+                    game_name=name,
+                    hole_cards=2,
+                    node_count=5,
+                    layout_name="single_board",
                 ),
                 __import__("types").SimpleNamespace(points=[], showdown_type=0),
             ),
         )
 
         class StubPokerState:
-            def __init__(self, players, game_def, rules, scoring_engine, callbacks=None):
+            def __init__(
+                self, players, game_def, rules, scoring_engine, callbacks=None
+            ):
                 from tests.conftest import FakeGame
+
                 self.game = FakeGame(players=players)
                 self.game_def = game_def
                 self.rules = rules
@@ -356,14 +376,19 @@ class TestLoadEdit:
             "app.services.game_service.load_game",
             lambda name: (
                 __import__("types").SimpleNamespace(
-                    game_name=name, hole_cards=2, node_count=5, layout_name="single_board"
+                    game_name=name,
+                    hole_cards=2,
+                    node_count=5,
+                    layout_name="single_board",
                 ),
                 __import__("types").SimpleNamespace(points=[], showdown_type=0),
             ),
         )
 
         class StubPokerState:
-            def __init__(self, players, game_def, rules, scoring_engine, callbacks=None):
+            def __init__(
+                self, players, game_def, rules, scoring_engine, callbacks=None
+            ):
                 self.game = FakeGame(players=players)
                 self.game_def = game_def
                 self.rules = rules
@@ -382,9 +407,10 @@ class TestLoadEdit:
 
     def test_hole_cards_round_trip_bit_for_bit(self, client, monkeypatch):
         # EDAPI-24
+        from poker_engine.cards.card import Card as CardObj
+
         from app.services.game_service import GameService
         from tests.conftest import FakeGame
-        from cards.card import Card as CardObj
 
         svc = GameService()
         svc.callbacks = None
@@ -394,14 +420,19 @@ class TestLoadEdit:
             "app.services.game_service.load_game",
             lambda name: (
                 __import__("types").SimpleNamespace(
-                    game_name=name, hole_cards=2, node_count=5, layout_name="single_board"
+                    game_name=name,
+                    hole_cards=2,
+                    node_count=5,
+                    layout_name="single_board",
                 ),
                 __import__("types").SimpleNamespace(points=[], showdown_type=0),
             ),
         )
 
         class StubPokerState:
-            def __init__(self, players, game_def, rules, scoring_engine, callbacks=None):
+            def __init__(
+                self, players, game_def, rules, scoring_engine, callbacks=None
+            ):
                 self.game = FakeGame(players=players)
                 self.game_def = game_def
                 self.rules = rules
@@ -415,13 +446,16 @@ class TestLoadEdit:
 
         assert resp.status_code == 200
 
-        expected_mask = (1 << CardObj.from_str("Ah").id) | (1 << CardObj.from_str("Kd").id)
+        expected_mask = (1 << CardObj.from_str("Ah").id) | (
+            1 << CardObj.from_str("Kd").id
+        )
         assert svc.state.game.players[0].hand_mask == expected_mask
 
 
 # ─────────────────────────────────────────────
 # 14.4 — /game/edit/cancel
 # ─────────────────────────────────────────────
+
 
 class TestCancelEdit:
 

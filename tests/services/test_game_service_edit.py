@@ -7,18 +7,19 @@ Strategy: direct instantiation via the `game_service_with_state` fixture
 entirely, per conftest.py). DB-touching tests (_delete_hand_records) use
 the real `db` SQLite fixture.
 """
-import pytest
+
 from types import SimpleNamespace
 
+import pytest
+
+from app.api.edit_api import EditStateRequest
 from app.services.game_service import GameService
-from app.api.edit_api import EditStateRequest, PlayerEditInput
-
-from tests.conftest import FakePlayer, FakeGame, FakePokerState, FakeLogger
-
+from tests.conftest import FakeLogger
 
 # ──────────────────────────────────────────────────────────────────
 # 16.1 — _snapshot_state / _restore_snapshot
 # ──────────────────────────────────────────────────────────────────
+
 
 class TestSnapshotRestore:
 
@@ -60,7 +61,9 @@ class TestSnapshotRestore:
         svc._restore_snapshot(snap)
         assert not hasattr(g, "discard_pile")
 
-    def test_GSE_04_player_attrs_absent_uses_getattr_defaults(self, game_service_with_state):
+    def test_GSE_04_player_attrs_absent_uses_getattr_defaults(
+        self, game_service_with_state
+    ):
         svc = game_service_with_state
         p = svc.state.game.players[0]
         del p.total_contribution
@@ -76,7 +79,9 @@ class TestSnapshotRestore:
         assert not hasattr(p, "total_contribution")
         assert not hasattr(p, "is_all_in")
 
-    def test_GSE_05_snapshot_copies_node_cards_not_aliases(self, game_service_with_state):
+    def test_GSE_05_snapshot_copies_node_cards_not_aliases(
+        self, game_service_with_state
+    ):
         svc = game_service_with_state
         snap = svc._snapshot_state()
 
@@ -91,12 +96,15 @@ class TestSnapshotRestore:
 # 16.2 — _apply_snapshot_to_state
 # ──────────────────────────────────────────────────────────────────
 
+
 class TestApplySnapshotToState:
 
     def _make_req(self, edit_state_request_factory, **overrides):
         return EditStateRequest(**edit_state_request_factory(**overrides))
 
-    def test_GSE_10_none_node_cards_stay_none(self, game_service_with_state, edit_state_request_factory, mocker):
+    def test_GSE_10_none_node_cards_stay_none(
+        self, game_service_with_state, edit_state_request_factory, mocker
+    ):
         svc = game_service_with_state
         fake_card = mocker.patch("app.services.game_service.CardObj")
         fake_card.from_str.side_effect = lambda s: SimpleNamespace(id=hash(s) % 52)
@@ -111,7 +119,9 @@ class TestApplySnapshotToState:
         assert svc.state.game.node_cards[2] is None
         assert svc.state.game.node_cards[1] is not None
 
-    def test_GSE_11_mixed_known_unknown_hole_cards(self, game_service_with_state, edit_state_request_factory, mocker):
+    def test_GSE_11_mixed_known_unknown_hole_cards(
+        self, game_service_with_state, edit_state_request_factory, mocker
+    ):
         svc = game_service_with_state
         fake_card = mocker.patch("app.services.game_service.CardObj")
         # deterministic small ids so bit math is easy to assert on
@@ -122,14 +132,22 @@ class TestApplySnapshotToState:
             edit_state_request_factory,
             players=[
                 {
-                    "seat": 1, "stack": 100, "current_bet": 0,
-                    "total_contribution": 0, "has_folded": False,
-                    "is_all_in": False, "hole_cards": ["Ah", None],
+                    "seat": 1,
+                    "stack": 100,
+                    "current_bet": 0,
+                    "total_contribution": 0,
+                    "has_folded": False,
+                    "is_all_in": False,
+                    "hole_cards": ["Ah", None],
                 },
                 {
-                    "seat": 2, "stack": 100, "current_bet": 0,
-                    "total_contribution": 0, "has_folded": False,
-                    "is_all_in": False, "hole_cards": [None, None],
+                    "seat": 2,
+                    "stack": 100,
+                    "current_bet": 0,
+                    "total_contribution": 0,
+                    "has_folded": False,
+                    "is_all_in": False,
+                    "hole_cards": [None, None],
                 },
             ],
         )
@@ -140,7 +158,9 @@ class TestApplySnapshotToState:
         p1 = svc.state.game.players[1]
         assert p1.hand_mask == 0
 
-    def test_GSE_12_seat_out_of_range_skipped(self, game_service_with_state, edit_state_request_factory, mocker):
+    def test_GSE_12_seat_out_of_range_skipped(
+        self, game_service_with_state, edit_state_request_factory, mocker
+    ):
         svc = game_service_with_state
         fake_card = mocker.patch("app.services.game_service.CardObj")
         fake_card.from_str.side_effect = lambda s: SimpleNamespace(id=0)
@@ -149,14 +169,22 @@ class TestApplySnapshotToState:
             edit_state_request_factory,
             players=[
                 {
-                    "seat": 99, "stack": 1, "current_bet": 0,
-                    "total_contribution": 0, "has_folded": False,
-                    "is_all_in": False, "hole_cards": [None, None],
+                    "seat": 99,
+                    "stack": 1,
+                    "current_bet": 0,
+                    "total_contribution": 0,
+                    "has_folded": False,
+                    "is_all_in": False,
+                    "hole_cards": [None, None],
                 },
                 {
-                    "seat": 0, "stack": 1, "current_bet": 0,
-                    "total_contribution": 0, "has_folded": False,
-                    "is_all_in": False, "hole_cards": [None, None],
+                    "seat": 0,
+                    "stack": 1,
+                    "current_bet": 0,
+                    "total_contribution": 0,
+                    "has_folded": False,
+                    "is_all_in": False,
+                    "hole_cards": [None, None],
                 },
             ],
         )
@@ -166,7 +194,9 @@ class TestApplySnapshotToState:
         assert svc.state.game.players[0].stack != 1
         assert svc.state.game.players[1].stack != 1
 
-    def test_GSE_13_discard_pile_rebuilt_when_present(self, game_service_with_state, edit_state_request_factory, mocker):
+    def test_GSE_13_discard_pile_rebuilt_when_present(
+        self, game_service_with_state, edit_state_request_factory, mocker
+    ):
         svc = game_service_with_state
         fake_card = mocker.patch("app.services.game_service.CardObj")
         fake_card.from_str.side_effect = lambda s: SimpleNamespace(id=5)
@@ -176,7 +206,9 @@ class TestApplySnapshotToState:
 
         assert svc.state.game.discard_pile == [5, 5]
 
-    def test_GSE_14_discard_pile_absent_skipped(self, game_service_with_state, edit_state_request_factory, mocker):
+    def test_GSE_14_discard_pile_absent_skipped(
+        self, game_service_with_state, edit_state_request_factory, mocker
+    ):
         svc = game_service_with_state
         del svc.state.game.discard_pile
         fake_card = mocker.patch("app.services.game_service.CardObj")
@@ -192,32 +224,43 @@ class TestApplySnapshotToState:
 # 16.3 — _validate_edit_request
 # ──────────────────────────────────────────────────────────────────
 
+
 class TestValidateEditRequest:
 
     def _req(self, edit_state_request_factory, **overrides):
         return EditStateRequest(**edit_state_request_factory(**overrides))
 
-    def test_GSE_20_all_unique_no_exception(self, game_service_with_state, edit_state_request_factory):
+    def test_GSE_20_all_unique_no_exception(
+        self, game_service_with_state, edit_state_request_factory
+    ):
         svc = game_service_with_state
         req = self._req(edit_state_request_factory)
         svc._validate_edit_request(req)  # should not raise
 
-    def test_GSE_21_duplicate_within_one_players_hole_cards(self, game_service_with_state, edit_state_request_factory):
+    def test_GSE_21_duplicate_within_one_players_hole_cards(
+        self, game_service_with_state, edit_state_request_factory
+    ):
         svc = game_service_with_state
         req = self._req(
             edit_state_request_factory,
             players=[
                 {
-                    "seat": 1, "stack": 100, "current_bet": 0,
-                    "total_contribution": 0, "has_folded": False,
-                    "is_all_in": False, "hole_cards": ["Ah", "Ah"],
+                    "seat": 1,
+                    "stack": 100,
+                    "current_bet": 0,
+                    "total_contribution": 0,
+                    "has_folded": False,
+                    "is_all_in": False,
+                    "hole_cards": ["Ah", "Ah"],
                 },
             ],
         )
         with pytest.raises(ValueError, match="Duplicate card"):
             svc._validate_edit_request(req)
 
-    def test_GSE_22_duplicate_between_node_and_discard(self, game_service_with_state, edit_state_request_factory):
+    def test_GSE_22_duplicate_between_node_and_discard(
+        self, game_service_with_state, edit_state_request_factory
+    ):
         svc = game_service_with_state
         req = self._req(
             edit_state_request_factory,
@@ -227,7 +270,9 @@ class TestValidateEditRequest:
         with pytest.raises(ValueError, match="Duplicate card"):
             svc._validate_edit_request(req)
 
-    def test_GSE_23_more_than_52_cards(self, game_service_with_state, edit_state_request_factory):
+    def test_GSE_23_more_than_52_cards(
+        self, game_service_with_state, edit_state_request_factory
+    ):
         svc = game_service_with_state
         ranks = "23456789TJQKA"
         suits = "shdc"
@@ -236,9 +281,13 @@ class TestValidateEditRequest:
 
         players = [
             {
-                "seat": 1, "stack": 100, "current_bet": 0,
-                "total_contribution": 0, "has_folded": False,
-                "is_all_in": False, "hole_cards": all_cards[:2],
+                "seat": 1,
+                "stack": 100,
+                "current_bet": 0,
+                "total_contribution": 0,
+                "has_folded": False,
+                "is_all_in": False,
+                "hole_cards": all_cards[:2],
             },
         ]
         node_cards = all_cards[2:7]
@@ -253,7 +302,9 @@ class TestValidateEditRequest:
         with pytest.raises(ValueError, match="More than 52 cards"):
             svc._validate_edit_request(req)
 
-    def test_GSE_24_multiple_violations_joined(self, game_service_with_state, edit_state_request_factory):
+    def test_GSE_24_multiple_violations_joined(
+        self, game_service_with_state, edit_state_request_factory
+    ):
         svc = game_service_with_state
         ranks = "23456789TJQKA"
         suits = "shdc"
@@ -262,9 +313,13 @@ class TestValidateEditRequest:
 
         players = [
             {
-                "seat": 1, "stack": 100, "current_bet": 0,
-                "total_contribution": 0, "has_folded": False,
-                "is_all_in": False, "hole_cards": [all_cards[0], all_cards[0]],
+                "seat": 1,
+                "stack": 100,
+                "current_bet": 0,
+                "total_contribution": 0,
+                "has_folded": False,
+                "is_all_in": False,
+                "hole_cards": [all_cards[0], all_cards[0]],
             },
         ]
         node_cards = all_cards[1:6]
@@ -289,6 +344,7 @@ class TestValidateEditRequest:
 # 16.4 — begin_edit / apply_edit / load_edit / cancel_edit
 # ──────────────────────────────────────────────────────────────────
 
+
 class TestEditLifecycle:
 
     def test_GSE_30_begin_edit_no_state_raises(self):
@@ -297,7 +353,9 @@ class TestEditLifecycle:
         with pytest.raises(RuntimeError):
             svc.begin_edit(db=None)
 
-    def test_GSE_31_begin_edit_no_logger_skips_delete(self, game_service_with_state, mocker):
+    def test_GSE_31_begin_edit_no_logger_skips_delete(
+        self, game_service_with_state, mocker
+    ):
         svc = game_service_with_state
         svc.logger = None
         delete_spy = mocker.patch.object(svc, "_delete_hand_records")
@@ -308,7 +366,9 @@ class TestEditLifecycle:
         assert svc.editing_mode is True
         delete_spy.assert_not_called()
 
-    def test_GSE_32_begin_edit_with_logger_hand_id_calls_delete(self, game_service_with_state, mocker):
+    def test_GSE_32_begin_edit_with_logger_hand_id_calls_delete(
+        self, game_service_with_state, mocker
+    ):
         svc = game_service_with_state
         svc.logger = FakeLogger(hand_id=42)
         delete_spy = mocker.patch.object(svc, "_delete_hand_records")
@@ -317,7 +377,9 @@ class TestEditLifecycle:
 
         delete_spy.assert_called_once_with("fake_db", 42)
 
-    def test_GSE_33_apply_edit_not_editing_raises(self, game_service_with_state, edit_state_request_factory):
+    def test_GSE_33_apply_edit_not_editing_raises(
+        self, game_service_with_state, edit_state_request_factory
+    ):
         svc = game_service_with_state
         svc.editing_mode = False
         req = EditStateRequest(**edit_state_request_factory())
@@ -333,9 +395,11 @@ class TestEditLifecycle:
         mocker.patch.object(svc, "_load_snapshot_from_request")
         mocker.patch.object(svc, "_progress_engine", return_value="dto")
 
-        req = EditStateRequest(**edit_state_request_factory(
-            node_cards=["Ah", "Ah", None, None, None],
-        ))
+        req = EditStateRequest(
+            **edit_state_request_factory(
+                node_cards=["Ah", "Ah", None, None, None],
+            )
+        )
 
         with pytest.raises(ValueError, match="Duplicate card"):
             svc.apply_edit(req)
@@ -350,9 +414,13 @@ class TestEditLifecycle:
         svc = game_service_with_state
         svc.editing_mode = False
 
-        mocker.patch("app.services.game_service.load_game", return_value=(
-            SimpleNamespace(game_name="holdem", hole_cards=2, node_count=5), SimpleNamespace()
-        ))
+        mocker.patch(
+            "app.services.game_service.load_game",
+            return_value=(
+                SimpleNamespace(game_name="holdem", hole_cards=2, node_count=5),
+                SimpleNamespace(),
+            ),
+        )
         mocker.patch("app.services.game_service.PokerState", return_value=svc.state)
         mocker.patch("app.services.game_service.CppScoringEngine")
         mocker.patch.object(svc, "_apply_snapshot_to_state")
@@ -369,35 +437,53 @@ class TestEditLifecycle:
     ):
         svc = game_service_with_state
 
-        mocker.patch("app.services.game_service.load_game", return_value=(
-            SimpleNamespace(game_name="omaha", hole_cards=4, node_count=5), SimpleNamespace()
-        ))
+        mocker.patch(
+            "app.services.game_service.load_game",
+            return_value=(
+                SimpleNamespace(game_name="omaha", hole_cards=4, node_count=5),
+                SimpleNamespace(),
+            ),
+        )
         captured = {}
 
-        def fake_poker_state_ctor(players, game_def, rules, scoring_engine, callbacks=None):
+        def fake_poker_state_ctor(
+            players, game_def, rules, scoring_engine, callbacks=None
+        ):
             captured["players"] = players
             return svc.state  # reuse existing fake state object as the "new" one
 
-        mocker.patch("app.services.game_service.PokerState", side_effect=fake_poker_state_ctor)
+        mocker.patch(
+            "app.services.game_service.PokerState", side_effect=fake_poker_state_ctor
+        )
         mocker.patch("app.services.game_service.CppScoringEngine")
         mocker.patch.object(svc, "_apply_snapshot_to_state")
         mocker.patch("app.services.game_service.state_to_dto", return_value="dto")
         build_continuation_spy = mocker.patch.object(svc, "_build_continuation_players")
 
-        req = EditStateRequest(**edit_state_request_factory(
-            players=[
-                {
-                    "seat": 1, "stack": 777, "current_bet": 0,
-                    "total_contribution": 0, "has_folded": False,
-                    "is_all_in": False, "hole_cards": ["Ah", "Kd"],
-                },
-                {
-                    "seat": 2, "stack": 888, "current_bet": 0,
-                    "total_contribution": 0, "has_folded": False,
-                    "is_all_in": False, "hole_cards": ["Qh", "Jc"],
-                },
-            ],
-        ))
+        req = EditStateRequest(
+            **edit_state_request_factory(
+                players=[
+                    {
+                        "seat": 1,
+                        "stack": 777,
+                        "current_bet": 0,
+                        "total_contribution": 0,
+                        "has_folded": False,
+                        "is_all_in": False,
+                        "hole_cards": ["Ah", "Kd"],
+                    },
+                    {
+                        "seat": 2,
+                        "stack": 888,
+                        "current_bet": 0,
+                        "total_contribution": 0,
+                        "has_folded": False,
+                        "is_all_in": False,
+                        "hole_cards": ["Qh", "Jc"],
+                    },
+                ],
+            )
+        )
         svc.load_edit(req)
 
         # fresh PlayerState objects built only from req.players[i].stack
@@ -413,7 +499,9 @@ class TestEditLifecycle:
         with pytest.raises(RuntimeError, match="No pre-edit snapshot"):
             svc.cancel_edit()
 
-    def test_GSE_38_cancel_edit_restores_and_resets_flags(self, game_service_with_state, mocker):
+    def test_GSE_38_cancel_edit_restores_and_resets_flags(
+        self, game_service_with_state, mocker
+    ):
         svc = game_service_with_state
         snap = svc._snapshot_state()
         svc.pre_edit_snapshot = snap
@@ -440,6 +528,7 @@ class TestEditLifecycle:
         svc.pre_edit_snapshot = svc._snapshot_state()
 
         import inspect
+
         sig = inspect.signature(svc.cancel_edit)
         assert list(sig.parameters.keys()) == []
 
@@ -452,41 +541,71 @@ class TestEditLifecycle:
 # 16.5 — _delete_hand_records
 # ──────────────────────────────────────────────────────────────────
 
+
 class TestDeleteHandRecords:
 
     def test_GSE_40_full_fk_chain_deleted(self, db, seeded_db, game_service_with_state):
-        from app.db.models.hands import Hand
         from app.db.models.actions import Action
-        from app.db.models.hole_cards import HoleCard
         from app.db.models.board_cards import BoardCard
         from app.db.models.hand_points import HandPoint
-        from app.db.models.point_results import PointResult
-        from app.db.models.point_cards import PointCard
+        from app.db.models.hands import Hand
+        from app.db.models.hole_cards import HoleCard
         from app.db.models.payouts import Payout
+        from app.db.models.point_cards import PointCard
+        from app.db.models.point_results import PointResult
 
-        hand = Hand(session_id=None, variant_name="holdem", layout_name="single_board",
-                    split_pot=False, dealer_seat=0, pot=10, is_hypothetical=False)
+        hand = Hand(
+            session_id=None,
+            variant_name="holdem",
+            layout_name="single_board",
+            split_pot=False,
+            dealer_seat=0,
+            pot=10,
+            is_hypothetical=False,
+        )
         db.add(hand)
         db.flush()
 
         hid = hand.hand_id
         pid = seeded_db["players"][0].player_id
 
-        hp = HandPoint(hand_id=hid, name="hand", showdown_type="SHOWDOWN",
-                        score_type="HIGH", node_set=0)
+        hp = HandPoint(
+            hand_id=hid,
+            name="hand",
+            showdown_type="SHOWDOWN",
+            score_type="HIGH",
+            node_set=0,
+        )
         db.add(hp)
         db.flush()
 
-        pr = PointResult(point_id=hp.point_id, player_id=pid, best_hand_mask=0,
-                          rank=1, hand_value=1, hand_category="pair", point_share=1.0)
+        pr = PointResult(
+            point_id=hp.point_id,
+            player_id=pid,
+            best_hand_mask=0,
+            rank=1,
+            hand_value=1,
+            hand_category="pair",
+            point_share=1.0,
+        )
         db.add(pr)
         db.flush()
 
         db.add(PointCard(point_result_id=pr.point_result_id, card=0, source="hole"))
         db.add(Payout(hand_id=hid, point_id=hp.point_id, player_id=pid, amount=10))
 
-        db.add(Action(hand_id=hid, street=0, action_index=0, player_id=pid,
-                      action_type="CALL", amount=2, pot_before=0, stack_before=100))
+        db.add(
+            Action(
+                hand_id=hid,
+                street=0,
+                action_index=0,
+                player_id=pid,
+                action_type="CALL",
+                amount=2,
+                pot_before=0,
+                stack_before=100,
+            )
+        )
         db.add(HoleCard(hand_id=hid, player_id=pid, street=0, card=0, visible=True))
         db.add(BoardCard(hand_id=hid, street=1, node=0, card=1))
         db.commit()
@@ -502,24 +621,50 @@ class TestDeleteHandRecords:
         assert db.query(HoleCard).filter(HoleCard.hand_id == hid).count() == 0
         assert db.query(BoardCard).filter(BoardCard.hand_id == hid).count() == 0
         assert db.query(HandPoint).filter(HandPoint.hand_id == hid).count() == 0
-        assert db.query(PointResult).filter(PointResult.point_id == point_id).count() == 0
-        assert db.query(PointCard).filter(PointCard.point_result_id == point_result_id).count() == 0
+        assert (
+            db.query(PointResult).filter(PointResult.point_id == point_id).count() == 0
+        )
+        assert (
+            db.query(PointCard)
+            .filter(PointCard.point_result_id == point_result_id)
+            .count()
+            == 0
+        )
         assert db.query(Payout).filter(Payout.hand_id == hid).count() == 0
 
-    def test_GSE_41_no_hand_point_rows_skips_cleanly(self, db, seeded_db, game_service_with_state):
-        from app.db.models.hands import Hand
+    def test_GSE_41_no_hand_point_rows_skips_cleanly(
+        self, db, seeded_db, game_service_with_state
+    ):
         from app.db.models.actions import Action
+        from app.db.models.hands import Hand
 
-        hand = Hand(session_id=None, variant_name="holdem", layout_name="single_board",
-                    split_pot=False, dealer_seat=0, pot=0, is_hypothetical=False)
+        hand = Hand(
+            session_id=None,
+            variant_name="holdem",
+            layout_name="single_board",
+            split_pot=False,
+            dealer_seat=0,
+            pot=0,
+            is_hypothetical=False,
+        )
         db.add(hand)
         db.flush()
         hid = hand.hand_id
 
         pid = seeded_db["players"][0].player_id
 
-        db.add(Action(hand_id=hid, street=0, action_index=0, player_id=pid,
-                       action_type="FOLD", amount=None, pot_before=0, stack_before=100))
+        db.add(
+            Action(
+                hand_id=hid,
+                street=0,
+                action_index=0,
+                player_id=pid,
+                action_type="FOLD",
+                amount=None,
+                pot_before=0,
+                stack_before=100,
+            )
+        )
         db.commit()
 
         svc = game_service_with_state
@@ -528,23 +673,39 @@ class TestDeleteHandRecords:
         assert db.query(Hand).filter(Hand.hand_id == hid).first() is None
         assert db.query(Action).filter(Action.hand_id == hid).count() == 0
 
-    def test_GSE_42_hand_points_but_no_point_results_skips_cleanly(self, db, game_service_with_state):
-        from app.db.models.hands import Hand
+    def test_GSE_42_hand_points_but_no_point_results_skips_cleanly(
+        self, db, game_service_with_state
+    ):
         from app.db.models.hand_points import HandPoint
+        from app.db.models.hands import Hand
 
-        hand = Hand(session_id=None, variant_name="holdem", layout_name="single_board",
-                    split_pot=False, dealer_seat=0, pot=0, is_hypothetical=False)
+        hand = Hand(
+            session_id=None,
+            variant_name="holdem",
+            layout_name="single_board",
+            split_pot=False,
+            dealer_seat=0,
+            pot=0,
+            is_hypothetical=False,
+        )
         db.add(hand)
         db.flush()
         hid = hand.hand_id
 
-        hp = HandPoint(hand_id=hid, name="hand", showdown_type="SHOWDOWN",
-                        score_type="HIGH", node_set=0)
+        hp = HandPoint(
+            hand_id=hid,
+            name="hand",
+            showdown_type="SHOWDOWN",
+            score_type="HIGH",
+            node_set=0,
+        )
         db.add(hp)
         db.commit()
 
         svc = game_service_with_state
-        svc._delete_hand_records(db, hid)  # pr_ids empty list — no PointCard delete attempted
+        svc._delete_hand_records(
+            db, hid
+        )  # pr_ids empty list — no PointCard delete attempted
 
         assert db.query(Hand).filter(Hand.hand_id == hid).first() is None
         assert db.query(HandPoint).filter(HandPoint.hand_id == hid).count() == 0

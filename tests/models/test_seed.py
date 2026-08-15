@@ -5,21 +5,19 @@ Tests run against SQLite in-memory; seed functions are patched to use
 the test session instead of the production SessionLocal.
 """
 
-import pytest
-from unittest.mock import patch
 
-from app.db.models.players import Player
-from app.db.models.poker_tables import PokerTable
 from app.db.models.bankroll_transaction import BankrollTransaction
 from app.db.models.betting_config import BettingConfig
 from app.db.models.betting_config_details import BettingConfigDetails
-
+from app.db.models.players import Player
+from app.db.models.poker_tables import PokerTable
 
 # ─────────────────────────────────────────────────────────────────
 # Helpers: inline re-implementations of seed functions that accept
 # an explicit db session (avoids patching SessionLocal globally).
 # These mirror seed.py logic exactly.
 # ─────────────────────────────────────────────────────────────────
+
 
 def _seed_player_tables(db):
     deposit_amount = 100
@@ -32,7 +30,9 @@ def _seed_player_tables(db):
 
     for i in range(1, 7):
         player_name = f"Player {i}"
-        existing_player = db.query(Player).filter(Player.username == player_name).first()
+        existing_player = (
+            db.query(Player).filter(Player.username == player_name).first()
+        )
         if not existing_player:
             new_player = Player(username=player_name, is_bot=False)
             db.add(new_player)
@@ -52,33 +52,38 @@ def _seed_player_tables(db):
 
 def _seed_betting_config_tables(db):
     config_name = "1/2"
-    betting_config = db.query(BettingConfig).filter(
-        BettingConfig.betting_config_name == config_name
-    ).first()
+    betting_config = (
+        db.query(BettingConfig)
+        .filter(BettingConfig.betting_config_name == config_name)
+        .first()
+    )
 
     if not betting_config:
         betting_config = BettingConfig(betting_config_name=config_name)
         db.add(betting_config)
         db.flush()
 
-        db.add_all([
-            BettingConfigDetails(
-                betting_config_id=betting_config.betting_config_id,
-                bet_name="SB",
-                bet_amount=1,
-            ),
-            BettingConfigDetails(
-                betting_config_id=betting_config.betting_config_id,
-                bet_name="BB",
-                bet_amount=2,
-            ),
-        ])
+        db.add_all(
+            [
+                BettingConfigDetails(
+                    betting_config_id=betting_config.betting_config_id,
+                    bet_name="SB",
+                    bet_amount=1,
+                ),
+                BettingConfigDetails(
+                    betting_config_id=betting_config.betting_config_id,
+                    bet_name="BB",
+                    bet_amount=2,
+                ),
+            ]
+        )
     db.commit()
 
 
 # ─────────────────────────────────────────────────────────────────
 # Tests
 # ─────────────────────────────────────────────────────────────────
+
 
 class TestSeedPlayerTables:
     def test_db10_creates_table_and_players(self, db):
@@ -89,9 +94,11 @@ class TestSeedPlayerTables:
         assert len(tables) == 1
         assert tables[0].max_players == 6
 
-        players = db.query(Player).filter(
-            Player.username.in_([f"Player {i}" for i in range(1, 7)])
-        ).all()
+        players = (
+            db.query(Player)
+            .filter(Player.username.in_([f"Player {i}" for i in range(1, 7)]))
+            .all()
+        )
         assert len(players) == 6
 
     def test_db11_idempotent(self, db):
@@ -102,9 +109,11 @@ class TestSeedPlayerTables:
         tables = db.query(PokerTable).filter(PokerTable.table_name == "Table 1").all()
         assert len(tables) == 1
 
-        players = db.query(Player).filter(
-            Player.username.in_([f"Player {i}" for i in range(1, 7)])
-        ).all()
+        players = (
+            db.query(Player)
+            .filter(Player.username.in_([f"Player {i}" for i in range(1, 7)]))
+            .all()
+        )
         assert len(players) == 6
 
     def test_db12_deposit_transactions_created(self, db):
@@ -115,10 +124,14 @@ class TestSeedPlayerTables:
         players = db.query(Player).filter(Player.username.in_(player_names)).all()
         player_ids = {p.player_id for p in players}
 
-        deposits = db.query(BankrollTransaction).filter(
-            BankrollTransaction.player_id.in_(player_ids),
-            BankrollTransaction.transaction_type == "DEPOSIT",
-        ).all()
+        deposits = (
+            db.query(BankrollTransaction)
+            .filter(
+                BankrollTransaction.player_id.in_(player_ids),
+                BankrollTransaction.transaction_type == "DEPOSIT",
+            )
+            .all()
+        )
 
         assert len(deposits) == 6
         for d in deposits:
@@ -131,14 +144,20 @@ class TestSeedBettingConfig:
         """DB-13: fresh DB → 1 BettingConfig '1/2' with SB=1 and BB=2."""
         _seed_betting_config_tables(db)
 
-        configs = db.query(BettingConfig).filter(
-            BettingConfig.betting_config_name == "1/2"
-        ).all()
+        configs = (
+            db.query(BettingConfig)
+            .filter(BettingConfig.betting_config_name == "1/2")
+            .all()
+        )
         assert len(configs) == 1
 
-        details = db.query(BettingConfigDetails).filter(
-            BettingConfigDetails.betting_config_id == configs[0].betting_config_id
-        ).all()
+        details = (
+            db.query(BettingConfigDetails)
+            .filter(
+                BettingConfigDetails.betting_config_id == configs[0].betting_config_id
+            )
+            .all()
+        )
         assert len(details) == 2
 
         by_name = {d.bet_name: d.bet_amount for d in details}
@@ -150,12 +169,18 @@ class TestSeedBettingConfig:
         _seed_betting_config_tables(db)
         _seed_betting_config_tables(db)
 
-        configs = db.query(BettingConfig).filter(
-            BettingConfig.betting_config_name == "1/2"
-        ).all()
+        configs = (
+            db.query(BettingConfig)
+            .filter(BettingConfig.betting_config_name == "1/2")
+            .all()
+        )
         assert len(configs) == 1
 
-        details = db.query(BettingConfigDetails).filter(
-            BettingConfigDetails.betting_config_id == configs[0].betting_config_id
-        ).all()
+        details = (
+            db.query(BettingConfigDetails)
+            .filter(
+                BettingConfigDetails.betting_config_id == configs[0].betting_config_id
+            )
+            .all()
+        )
         assert len(details) == 2

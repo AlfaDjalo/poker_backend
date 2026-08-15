@@ -7,16 +7,12 @@ Tests run against SQLite in-memory via the shared `db` fixture in conftest.py.
 import pytest
 from sqlalchemy.exc import IntegrityError
 
-from app.db.base import Base
-from app.db.models.players import Player
-from app.db.models.poker_tables import PokerTable
-from app.db.models.poker_sessions import PokerSession
-from app.db.models.table_seating import TableSeat
-from app.db.models.hands import Hand
 from app.db.models.actions import Action
-from app.db.models.hole_cards import HoleCard
 from app.db.models.annotations import Annotation
-from app.db.models.betting_config import BettingConfig
+from app.db.models.hands import Hand
+from app.db.models.hole_cards import HoleCard
+from app.db.models.players import Player
+from app.db.models.table_seating import TableSeat
 
 
 class TestSchemaCreation:
@@ -25,7 +21,9 @@ class TestSchemaCreation:
         The `db` fixture already called create_all; if we got here it worked."""
         # Verify at least one known table exists by querying it
         result = db.execute(
-            __import__("sqlalchemy").text("SELECT name FROM sqlite_master WHERE type='table'")
+            __import__("sqlalchemy").text(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
         ).fetchall()
         table_names = {r[0] for r in result}
         assert "players" in table_names
@@ -128,9 +126,16 @@ class TestUniqueConstraints:
         seat1 = TableSeat(session_id=session_id, seat_number=99, player_id=player_id)
         db.add(seat1)
         db.flush()
+        db.expunge(seat1)
 
-        seat2 = TableSeat(session_id=session_id, seat_number=99, player_id=player_id)
-        db.add(seat2)
-        with pytest.raises(IntegrityError):
-            db.flush()
-        db.rollback()
+        with pytest.raises(IntegrityError), db.begin_nested():
+            seat2 = TableSeat(
+                session_id=session_id, seat_number=99, player_id=player_id
+            )
+            db.add(seat2)
+
+        # seat2 = TableSeat(session_id=session_id, seat_number=99, player_id=player_id)
+        # db.add(seat2)
+        # with pytest.raises(IntegrityError):
+        #     db.flush()
+        # db.rollback()

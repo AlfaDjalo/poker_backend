@@ -1,8 +1,8 @@
-from sqlalchemy.orm import session
-
+from app.db.models.action import Action
 from app.db.models.game import Game
 from app.db.models.hand import Hand
-from app.db.models.action import Action
+from sqlalchemy.orm import session
+
 
 class GameLogger:
 
@@ -24,9 +24,7 @@ class GameLogger:
     def start_hand(self, hand_number, hole_cards):
 
         hand = Hand(
-            game_id=self.game_id,
-            hand_number=hand_number,
-            hole_cards=hole_cards
+            game_id=self.game_id, hand_number=hand_number, hole_cards=hole_cards
         )
 
         self.db.add(hand)
@@ -35,21 +33,14 @@ class GameLogger:
 
         self.hand_id = hand.id
 
-    def log_action(
-            self,
-            street,
-            player,
-            action,
-            amount,
-            state
-    ):
+    def log_action(self, street, player, action, amount, state):
         a = Action(
             hand_id=self.hand_id,
             street=street,
             player_index=player,
             action=action,
             amount=amount,
-            state=state
+            state=state,
         )
 
         self.db.add(a)
@@ -63,4 +54,3 @@ class GameLogger:
         hand.result = result
 
         self.db.commit()
-

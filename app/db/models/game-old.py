@@ -1,7 +1,8 @@
-from sqlalchemy import Column, Integer, DateTime, JSON
+from sqlalchemy import JSON, Column, DateTime, Integer
 from sqlalchemy.sql import func
 
 from app.db.base import Base
+
 
 class Game(Base):
     __tablename__ = "games"

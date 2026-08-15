@@ -2,19 +2,20 @@
 conftest.py — shared fixtures for the test suite.
 Place this file in the same directory as your test_*.py files.
 """
+
+from types import SimpleNamespace
+
 import pytest
+from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
-from fastapi.testclient import TestClient
 
 from app.db.base import Base
-import app.db.models
 from app.db.models.players import Player
-from app.db.models.poker_tables import PokerTable
 from app.db.models.poker_sessions import PokerSession
+from app.db.models.poker_tables import PokerTable
 
-from types import SimpleNamespace
 
 @pytest.fixture()
 def db():
@@ -64,24 +65,31 @@ def seeded_db(db):
 
     bc = BettingConfig(betting_config_id=1, betting_config_name="default")
     db.add(bc)
-    db.flush()    
-    db.add_all([
-        BettingConfigDetails(betting_config_id=1, bet_name="SB", bet_amount=1),
-        BettingConfigDetails(betting_config_id=1, bet_name="BB", bet_amount=2),
-    ])
+    db.flush()
+    db.add_all(
+        [
+            BettingConfigDetails(betting_config_id=1, bet_name="SB", bet_amount=1),
+            BettingConfigDetails(betting_config_id=1, bet_name="BB", bet_amount=2),
+        ]
+    )
 
     session = PokerSession(table_id=table.table_id)
     db.add(session)
     db.commit()
 
-    return {"table": table, "players": players, "session": session, "betting_config": bc}
+    return {
+        "table": table,
+        "players": players,
+        "session": session,
+        "betting_config": bc,
+    }
 
 
 @pytest.fixture()
 def seeded_client(db, seeded_db):
     """TestClient with get_db overridden to use the in-memory SQLite DB."""
-    from app.main import app
     from app.api.deps import get_db
+    from app.main import app
 
     # Use a concrete inner function instead of a broken lambda generator
     def _override_get_db():
@@ -99,10 +107,19 @@ def seeded_client(db, seeded_db):
 
     app.dependency_overrides.clear()
 
+
 class FakePlayer:
     """Minimal stand-in for engine PlayerState — only attrs game_service.py touches."""
-    def __init__(self, stack=100, hand_mask=0, current_bet=0,
-                 total_contribution=0, has_folded=False, is_all_in=False):
+
+    def __init__(
+        self,
+        stack=100,
+        hand_mask=0,
+        current_bet=0,
+        total_contribution=0,
+        has_folded=False,
+        is_all_in=False,
+    ):
         self.stack = stack
         self.hand_mask = hand_mask
         self.current_bet = current_bet
@@ -113,9 +130,19 @@ class FakePlayer:
 
 class FakeGame:
     """Minimal stand-in for PokerState.game."""
-    def __init__(self, players=None, street_index=0, pot=0, dealer_position=0,
-                 current_player=0, bet_to_call=0, min_raise=2,
-                 node_cards=None, discard_pile=None):
+
+    def __init__(
+        self,
+        players=None,
+        street_index=0,
+        pot=0,
+        dealer_position=0,
+        current_player=0,
+        bet_to_call=0,
+        min_raise=2,
+        node_cards=None,
+        discard_pile=None,
+    ):
         self.players = players or [FakePlayer() for _ in range(2)]
         self.street_index = street_index
         self.pot = pot
@@ -130,7 +157,7 @@ class FakeGame:
         """Stub — real engine returns ActionType enum members; an empty
         list is sufficient since state_to_dto only does `a.name.lower()`
         over whatever this returns."""
-        return []        
+        return []
 
 
 class FakePokerState:
@@ -140,11 +167,15 @@ class FakePokerState:
     assembly should use the real engine (integration tier); this fixture
     is for GSE-* unit tests that only exercise GameService logic.
     """
+
     def __init__(self, game=None, game_def=None, rules=None, phase=None):
         self.game = game or FakeGame()
         self.game_def = game_def or SimpleNamespace(
-            game_name="holdem", hole_cards=2, node_count=5,
-            layout_name="single_board", street_names=None            
+            game_name="holdem",
+            hole_cards=2,
+            node_count=5,
+            layout_name="single_board",
+            street_names=None,
         )
         self.rules = rules or SimpleNamespace(points=[], showdown_type=0)
         self.phase = phase or SimpleNamespace(name="BETTING")
@@ -153,6 +184,7 @@ class FakePokerState:
 
 class FakeLogger:
     """Stand-in for SessionLogger — records calls without touching the DB."""
+
     def __init__(self, hand_id=None):
         self.hand_id = hand_id
         self.calls = []
@@ -221,14 +253,22 @@ def make_edit_state_request(**overrides):
         "min_raise": 2,
         "players": [
             {
-                "seat": 1, "stack": 100, "current_bet": 0,
-                "total_contribution": 0, "has_folded": False,
-                "is_all_in": False, "hole_cards": ["Ah", "Kd"],
+                "seat": 1,
+                "stack": 100,
+                "current_bet": 0,
+                "total_contribution": 0,
+                "has_folded": False,
+                "is_all_in": False,
+                "hole_cards": ["Ah", "Kd"],
             },
             {
-                "seat": 2, "stack": 100, "current_bet": 0,
-                "total_contribution": 0, "has_folded": False,
-                "is_all_in": False, "hole_cards": ["Qh", "Jc"],
+                "seat": 2,
+                "stack": 100,
+                "current_bet": 0,
+                "total_contribution": 0,
+                "has_folded": False,
+                "is_all_in": False,
+                "hole_cards": ["Qh", "Jc"],
             },
         ],
         "node_cards": [None, None, None, None, None],

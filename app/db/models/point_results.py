@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, BigInteger, Float, String, ForeignKey
+from sqlalchemy import BigInteger, Column, Float, ForeignKey, Integer, String
 
 from app.db.base import Base
 
@@ -12,5 +12,5 @@ class PointResult(Base):
     best_hand_mask = Column(BigInteger)
     rank = Column(Integer)
     hand_value = Column(Integer)
-    hand_category = Column(String, nullable=False)
+    hand_category = Column(String, nullable=True)
     point_share = Column(Float, nullable=False)
