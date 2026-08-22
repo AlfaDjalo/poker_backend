@@ -49,6 +49,26 @@ def canonicalize_hole_cards(card_strs: list[str]) -> str:
     return f"{ranks[0]}{ranks[1]}{'s' if suited else 'o'}"
 
 
+def format_hero_hand_display(card_strs: list[str]) -> str:
+    """
+    Scoreboard-history "hand" display for the hero's hole cards,
+    regardless of how many the game deals. Hold'em-style 2-card hands
+    still get the compact canonical notation ("AKs"/"AKo"/"TT"); any
+    other count (e.g. 4 for Omaha) falls back to a plain space-joined
+    card list, since standard suited/offsuit canonicalization is only
+    meaningfully defined for exactly 2 cards.
+
+    Previously trainer_service.py called canonicalize_hole_cards()
+    directly for every scenario, which raised ValueError (uncaught,
+    surfacing as a raw 500) for any non-2-hole-card game the instant a
+    decision was graded — this is what broke the double-board Omaha
+    scenario's action submission entirely.
+    """
+    if len(card_strs) == 2:
+        return canonicalize_hole_cards(card_strs)
+    return " ".join(card_strs)
+
+
 @dataclass(frozen=True)
 class DecisionContext:
     """Everything an evaluator needs to judge one hero decision."""

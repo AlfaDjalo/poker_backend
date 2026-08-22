@@ -27,6 +27,10 @@ class TrainerActionRequest(BaseModel):
     action_type: str  # "fold" | "check" | "call" | "bet" | "all_in"
 
 
+class TrainerCheckpointRequest(BaseModel):
+    filename: str | None = None  # None/"" clears selection -> config default
+
+
 @router.get("/scenarios")
 def list_scenarios():
     """Scenario types available in the Trainer dropdown, from training_config.yaml."""
@@ -54,6 +58,30 @@ def new_scenario(scenario_key: str):
         # the failure diagnosable and gives the frontend text to show.
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+
+
+@router.get("/scenarios/{scenario_key}/checkpoints")
+def list_checkpoints(scenario_key: str):
+    """.pt files available in this scenario's configured checkpoint_dir,
+    plus which one (if any) is currently selected — for the Trainer
+    UI's model-picker dropdown."""
+    try:
+        return trainer_service.list_checkpoints(scenario_key)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.post("/scenarios/{scenario_key}/checkpoint")
+def select_checkpoint(scenario_key: str, req: TrainerCheckpointRequest):
+    """Select which checkpoint file this scenario should load on its
+    next agent build (lazy — doesn't reload immediately). Empty/omitted
+    filename reverts to the config default."""
+    try:
+        return trainer_service.select_checkpoint(scenario_key, req.filename)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.get("/state")
@@ -156,3 +184,21 @@ def get_history_entry(entry_id: int):
         return trainer_service.get_history_snapshot(entry_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.get("/history/{entry_id}/grid")
+def get_history_hand_grid(entry_id: int):
+    """
+    Full hand action-probability grid recreated for a PAST, already-
+    graded scoreboard decision — same shape as GET /trainer/grid, but
+    rebuilt from the stored decision-point context (see
+    Scoreboard._grid_contexts / TrainerService._serialize_obs) rather
+    than the live in-progress scenario.
+    """
+    try:
+        return trainer_service.get_history_hand_grid(entry_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")

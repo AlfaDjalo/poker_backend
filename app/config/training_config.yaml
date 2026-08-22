@@ -75,6 +75,11 @@ scenarios:
     # "rl_policy" evaluator below if selected).
     policy:
       checkpoint_path: "checkpoints/push_fold_duo/ckpt_push_fold.pt"
+      # Directory the Trainer UI lists .pt files from so the user can
+      # pick which checkpoint to play against (see GET
+      # /trainer/scenarios/{key}/checkpoints). checkpoint_path above
+      # remains the default used until the user selects one.
+      checkpoint_dir: "checkpoints/push_fold_duo"
       encoder_path: "encoders/encoder_model.keras"
       encoder_embedding_dim: 32
       variant: shared_trunk_two_heads
@@ -98,6 +103,19 @@ scenarios:
     actions:
       SB: ["fold", "all_in"]
       BB: ["fold", "call"]
+
+    # Trainer-level action string -> abstract ActionType name (+ optional
+    # pot_fraction for bet-like actions) — see trainer_config.py's
+    # ActionMapEntry docstring. push-fold's action names are already
+    # valid abstract ActionType names 1:1 (fold/all_in/call), so this is
+    # just the identity map spelled out explicitly rather than left to
+    # _default_action_map's fallback, for the same self-documenting
+    # reason showdown_constraints.yaml's HOLDEM entry spells out values
+    # matching the code's own defaults.
+    action_map:
+      fold: fold
+      all_in: all_in
+      call: call
 
   river_duo:
     label: "Heads-Up River"
@@ -137,14 +155,17 @@ scenarios:
     villain_matches_hero_range: true
 
     # Dead-money pot carried in from streets this drill doesn't model,
-    # in big blinds — matches scenarios/duo_games/river_duo.yaml's
-    # pot: {mode: randomized_bb, min_pot_bb: 2.0, max_pot_bb: 20.0}.
-    # TrainerService draws a random pot in this range at scenario
-    # start and sets it directly as game.pot (see that module's river
-    # setup — no blinds are posted for this variant).
+    # in big blinds — FIXED at 50bb (-> 100 chips at big_blind=2),
+    # matching double_board_plo_river_duo's own pot sizing convention
+    # (min == max, same "fixed" pattern stack_bb above uses). Every
+    # river_duo decision should face a pot of exactly 100, not a
+    # randomized stack-to-pot ratio. TrainerService draws from this
+    # range at scenario start and sets it directly as game.pot (see
+    # that module's river setup — no blinds are posted for this
+    # variant).
     pot_bb:
-      min: 2.0
-      max: 20.0
+      min: 50.0
+      max: 50.0
 
     small_blind: 1
     big_blind: 2
@@ -160,6 +181,7 @@ scenarios:
 
     policy:
       checkpoint_path: "checkpoints/river_duo/ckpt_river_duo.pt"
+      checkpoint_dir: "checkpoints/river_duo"
       encoder_path: "encoders/encoder_model.keras"
       encoder_embedding_dim: 32
       variant: shared_trunk_two_heads
@@ -180,3 +202,450 @@ scenarios:
     actions:
       OOP: ["check", "bet", "call", "fold"]
       IP: ["check", "bet", "call", "fold"]
+
+    # "bet" here is the ONE bet size river_duo's trained policy ever saw
+    # (BET_100). Sized as a full shove (sizing: stack) rather than
+    # pot-relative — river_duo's whole point is training shove-or-check
+    # decisions, and a shove is unambiguous regardless of how stack_bb/
+    # pot_bb happen to be tuned (pot-sizing would only equal a shove
+    # when stack <= pot, which isn't guaranteed to hold as those ranges
+    # change independently). A future scenario offering, say, a
+    # half-pot bet alongside the shove would add a SECOND entry here
+    # (e.g. `bet_half: {abstract: bet_50, sizing: pot, pot_fraction:
+    # 0.5}`) plus that name in its own `actions` list —
+    # trainer_service.py needs no changes to support it.
+    action_map:
+      fold: fold
+      check: check
+      call: call
+      bet:
+        abstract: bet_100
+        sizing: stack
+
+  double_board_plo_river_duo:
+    label: "Heads-Up Double-board PLO River"
+    description: >
+      Heads-up double-board PLO river trainer. Fixed 100bb effective stacks, randomized
+      pot size, random position (OOP or IP), random hand, full random
+      board. Evaluate whether the hero's decision (check/bet, or
+      call/fold when facing a bet) matches the trained policy's
+      preferred action.
+
+    # poker_engine variant yaml (poker_engine/games/double_board_plo_river.yaml)
+    # — deals 4 hole cards + the full 10-node DOUBLE board immediately,
+    # then restricts the single river betting street to
+    # CHECK/BET(pot)/CALL/FOLD via GameState's river_only branch.
+    #
+    # Previously this was set to "river" (the single-board 5-node
+    # game) — same betting_type, so nothing about the ACTION tree
+    # looked wrong, but it meant only one 5-card board was ever dealt
+    # and scored, silently discarding the whole "double board" part of
+    # this scenario. double_board_plo_river.yaml is the double-board
+    # counterpart of river.yaml (10 nodes / two HIGH points /
+    # split_pot), analogous to how double_board_plo_bomb_pot.yaml
+    # relates to holdem.yaml.
+    engine_variant: double_board_plo_river
+
+    # Matches double_board_plo.yaml (poker_engine/games) — the base
+    # double-board PLO game definition the trained policy's
+    # GameEncoder token and board/point structure were computed
+    # against, same relationship holdem.yaml has to push_fold_duo/
+    # river_duo's rl_game_name: holdem (see those scenarios' own
+    # comments). Inference still declares this base game name even
+    # though the real legal-action set comes from
+    # double_board_plo_river.yaml's river_only betting type.
+    rl_game_name: double_board_plo
+
+    betting_type: river_only
+
+    hero_seat: 0
+    villain_seat: 1
+
+    # river_duo.yaml: stack.mode: fixed_bb, stack_bb: 100.0 — both
+    # seats always start the street at the same 100bb effective stack,
+    # unlike push-fold-duo's randomized range. min == max encodes
+    # "fixed" through the existing StackRange shape without needing a
+    # new config field.
+    stack_bb:
+      min: 100.0
+      max: 100.0
+    villain_matches_hero_range: true
+
+    # Dead-money pot carried in from streets this drill doesn't model,
+    # in big blinds. Unlike river_duo's randomized 2-20bb range, this
+    # scenario uses a FIXED $100 pot (min == max, same "fixed" pattern
+    # stack_bb above uses) — big_blind=2, so pot_bb 50 * 2 = 100 chips.
+    # TrainerService draws from this range at scenario start and sets
+    # it directly as game.pot (see that module's river setup — no
+    # blinds are posted for this variant).
+    pot_bb:
+      min: 50.0
+      max: 50.0
+
+
+    small_blind: 1
+    big_blind: 2
+
+    # River's roles are about board position, not blinds — OOP acts
+    # first (river_duo.yaml's start node). This MUST match the keys of
+    # `actions` below exactly, in first-to-act order — see the
+    # module-level note at the top of this file for why (previously
+    # this was [SB, BB], which never matched the OOP/IP-keyed actions
+    # block below, silently zeroing out hero's allowed actions on
+    # every river hand).
+    positions: [OOP, IP]
+
+    policy:
+      checkpoint_path: "checkpoints/double_board_plo_river_duo/ckpt_river_duo_new.pt"
+      checkpoint_dir: "checkpoints/double_board_plo_river_duo"
+      encoder_path: "encoders/encoder_model.keras"
+      encoder_embedding_dim: 32
+      variant: shared_trunk_two_heads
+      allow_untrained_fallback: true
+
+    evaluator:
+      type: rl_policy_frequency
+      params: {}
+
+    # Unlike push_fold_duo, a river position's allowed action set is
+    # NOT fixed for the whole hand — OOP sees {check, bet} on its first
+    # decision but {call, fold} if it checked and IP then bet. This
+    # list is the UNION of every action a hero at this position could
+    # ever face across the whole scenario; trainer_service.py's
+    # _live_allowed_actions() narrows it down to exactly what's legal
+    # at the CURRENT decision point (check/bet OR call/fold, never
+    # all four at once) before it ever reaches the frontend.
+    actions:
+      OOP: ["check", "bet", "call", "fold"]
+      IP: ["check", "bet", "call", "fold"]
+
+    # See river_duo's own action_map comment above — same shape, this
+    # scenario's single bet size is also a full shove (sizing: stack).
+    action_map:
+      fold: fold
+      check: check
+      call: call
+      bet:
+        abstract: bet_100
+        sizing: stack
+
+  # ------------------------------------------------------------------
+  # New scenarios below. push_fold_duo and river_duo above already
+  # exist and cover the two new *_duo tree files of the same name
+  # exactly — no new entry needed for either of those.
+  # ------------------------------------------------------------------
+
+  river_duo_two_sizes:
+    label: "Heads-Up River (2 sizes)"
+    description: >
+      Heads-up river trainer with two available bet sizes (50% pot,
+      100% pot) instead of river_duo's single pot-sized bet. Reuses
+      river.yaml unchanged — no new engine file needed, sizing is
+      entirely config-driven via action_map below.
+
+    engine_variant: river
+    rl_game_name: holdem
+    betting_type: river_only
+
+    hero_seat: 0
+    villain_seat: 1
+
+    stack_bb:
+      min: 100.0
+      max: 100.0
+    villain_matches_hero_range: true
+
+    pot_bb:
+      min: 50.0
+      max: 50.0
+
+    small_blind: 1
+    big_blind: 2
+    positions: [OOP, IP]
+
+    policy:
+      checkpoint_path: "checkpoints/river_duo_two_sizes/ckpt_river_duo_two_sizes.pt"
+      checkpoint_dir: "checkpoints/river_duo_two_sizes"
+      encoder_path: "encoders/encoder_model.keras"
+      encoder_embedding_dim: 32
+      variant: shared_trunk_two_heads
+      allow_untrained_fallback: true
+
+    evaluator:
+      type: rl_policy_frequency
+      params: {}
+
+    # Both bet_half and bet_full are "bet-like" (sizing set) so
+    # cfg.bet_like_actions() offers BOTH simultaneously at a
+    # check-or-bet decision, matching river_duo_two_sizes.yaml's tree
+    # (BET_50 and BET_100 as sibling options off the same node).
+    actions:
+      OOP: ["check", "bet_half", "bet_full", "call", "fold"]
+      IP: ["check", "bet_half", "bet_full", "call", "fold"]
+
+    action_map:
+      fold: fold
+      check: check
+      call: call
+      bet_half:
+        abstract: bet_50
+        sizing: pot
+        pot_fraction: 0.5
+      bet_full:
+        abstract: bet_100
+        sizing: pot
+        pot_fraction: 1.0
+
+  triple_board_3point_river:
+    label: "Heads-Up Triple-Board River"
+    description: >
+      Heads-up river-only triple-board High/High/High (3 points).
+      Fixed 100bb stacks, randomized pot, random position, random
+      hand, all three boards revealed at once. Single pot-sized bet,
+      no re-raises.
+
+    engine_variant: triple_board_3point_river
+    rl_game_name: triple_board_3point_river
+    betting_type: river_only
+
+    hero_seat: 0
+    villain_seat: 1
+
+    stack_bb:
+      min: 100.0
+      max: 100.0
+    villain_matches_hero_range: true
+
+    pot_bb:
+      min: 50.0
+      max: 50.0
+
+    small_blind: 1
+    big_blind: 2
+    positions: [OOP, IP]
+
+    policy:
+      checkpoint_path: "checkpoints/triple_board_3point_river/ckpt_triple_board_3point_river.pt"
+      checkpoint_dir: "checkpoints/triple_board_3point_river"
+      encoder_path: "encoders/encoder_model.keras"
+      encoder_embedding_dim: 32
+      variant: shared_trunk_two_heads
+      allow_untrained_fallback: true
+
+    evaluator:
+      type: rl_policy_frequency
+      params: {}
+
+    actions:
+      OOP: ["check", "bet", "call", "fold"]
+      IP: ["check", "bet", "call", "fold"]
+
+    action_map:
+      fold: fold
+      check: check
+      call: call
+      bet:
+        abstract: bet_100
+        sizing: stack
+
+  double_board_high_high_hand_river:
+    label: "Heads-Up High/High/Hand River"
+    description: >
+      Heads-up river-only double-board High/High/Hand (3 points): best
+      high on board1, best high on board2, best 5-card hand from the 5
+      hole cards alone. Fixed 100bb stacks, randomized pot. Single
+      pot-sized bet, no re-raises.
+
+    engine_variant: double_board_high_high_hand_river
+    rl_game_name: double_board_high_high_hand_river
+    betting_type: river_only
+
+    hero_seat: 0
+    villain_seat: 1
+
+    stack_bb:
+      min: 100.0
+      max: 100.0
+    villain_matches_hero_range: true
+
+    pot_bb:
+      min: 50.0
+      max: 50.0
+
+    small_blind: 1
+    big_blind: 2
+    positions: [OOP, IP]
+
+    policy:
+      checkpoint_path: "checkpoints/double_board_high_high_hand_river/ckpt.pt"
+      checkpoint_dir: "checkpoints/double_board_high_high_hand_river"
+      encoder_path: "encoders/encoder_model.keras"
+      encoder_embedding_dim: 32
+      variant: shared_trunk_two_heads
+      allow_untrained_fallback: true
+
+    evaluator:
+      type: rl_policy_frequency
+      params: {}
+
+    actions:
+      OOP: ["check", "bet", "call", "fold"]
+      IP: ["check", "bet", "call", "fold"]
+
+    action_map:
+      fold: fold
+      check: check
+      call: call
+      bet:
+        abstract: bet_100
+        sizing: stack
+
+  drawmaha_river:
+    label: "Heads-Up Drawmaha River"
+    description: >
+      Heads-up river-only Drawmaha (Omaha-style showdown, 4 hole
+      cards, single board). Fixed 100bb stacks, randomized pot. Single
+      pot-sized bet, no re-raises.
+
+    engine_variant: drawmaha_river
+    rl_game_name: drawmaha_river
+    betting_type: river_only
+
+    hero_seat: 0
+    villain_seat: 1
+
+    stack_bb:
+      min: 100.0
+      max: 100.0
+    villain_matches_hero_range: true
+
+    pot_bb:
+      min: 50.0
+      max: 50.0
+
+    small_blind: 1
+    big_blind: 2
+    positions: [OOP, IP]
+
+    policy:
+      checkpoint_path: "checkpoints/drawmaha_river/ckpt_drawmaha_river.pt"
+      checkpoint_dir: "checkpoints/drawmaha_river"
+      encoder_path: "encoders/encoder_model.keras"
+      encoder_embedding_dim: 32
+      variant: shared_trunk_two_heads
+      allow_untrained_fallback: true
+
+    evaluator:
+      type: rl_policy_frequency
+      params: {}
+
+    actions:
+      OOP: ["check", "bet", "call", "fold"]
+      IP: ["check", "bet", "call", "fold"]
+
+    action_map:
+      fold: fold
+      check: check
+      call: call
+      bet:
+        abstract: bet_100
+        sizing: stack
+
+  holdem_full_duo:
+    label: "Heads-Up Full Hold'em (pot-bet, no re-raise)"
+    description: >
+      A complete heads-up hold'em hand — preflop, flop, turn, river —
+      with a real betting round each street, restricted to check-or-
+      pot-bet / call-or-fold (no re-raises). Randomized stack, random
+      position, random hand, board revealed street by street.
+
+    engine_variant: holdem_full_duo
+    rl_game_name: holdem
+    betting_type: single_bet
+
+    hero_seat: 0
+    villain_seat: 1
+
+    # Real posted blinds — no pot_bb block. _apply_dead_pot() in
+    # trainer_service.py exempts betting_type: single_bet (same as
+    # push_fold) so the actually-posted blinds are left as the pot
+    # rather than being overwritten by a randomized dead pot.
+    stack_bb:
+      min: 20.0
+      max: 100.0
+    villain_matches_hero_range: true
+
+    small_blind: 1
+    big_blind: 2
+    positions: [SB, BB]
+
+    policy:
+      checkpoint_path: "checkpoints/holdem_full_duo/ckpt_holdem_full_duo.pt"
+      checkpoint_dir: "checkpoints/holdem_full_duo"
+      encoder_path: "encoders/encoder_model.keras"
+      encoder_embedding_dim: 32
+      variant: shared_trunk_two_heads
+      allow_untrained_fallback: true
+
+    evaluator:
+      type: rl_policy_frequency
+      params: {}
+
+    actions:
+      SB: ["fold", "check", "call", "bet"]
+      BB: ["fold", "check", "call", "bet"]
+
+    action_map:
+      fold: fold
+      check: check
+      call: call
+      bet:
+        abstract: bet_100
+        sizing: pot
+        pot_fraction: 1.0
+
+  omaha_full_duo:
+    label: "Heads-Up Full Omaha (pot-bet, no re-raise)"
+    description: >
+      Same shape as holdem_full_duo, Omaha showdown / 4 hole cards.
+
+    engine_variant: omaha_full_duo
+    rl_game_name: omaha
+    betting_type: single_bet
+
+    hero_seat: 0
+    villain_seat: 1
+
+    stack_bb:
+      min: 20.0
+      max: 100.0
+    villain_matches_hero_range: true
+
+    small_blind: 1
+    big_blind: 2
+    positions: [SB, BB]
+
+    policy:
+      checkpoint_path: "checkpoints/omaha_full_duo/ckpt_omaha_full_duo.pt"
+      checkpoint_dir: "checkpoints/omaha_full_duo"
+      encoder_path: "encoders/encoder_model.keras"
+      encoder_embedding_dim: 32
+      variant: shared_trunk_two_heads
+      allow_untrained_fallback: true
+
+    evaluator:
+      type: rl_policy_frequency
+      params: {}
+
+    actions:
+      SB: ["fold", "check", "call", "bet"]
+      BB: ["fold", "check", "call", "bet"]
+
+    action_map:
+      fold: fold
+      check: check
+      call: call
+      bet:
+        abstract: bet_100
+        sizing: pot
+        pot_fraction: 1.0

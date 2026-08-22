@@ -89,12 +89,115 @@ class PolicyConfig:
     encoder_embedding_dim: int | None = None
     variant: str = "shared_trunk_two_heads"
     allow_untrained_fallback: bool = True
+    # Directory the user can pick a checkpoint from at runtime (see
+    # TrainerService.list_checkpoints/select_checkpoint). Optional —
+    # scenarios that don't set this only ever use checkpoint_path, same
+    # as before. Resolved the same way as checkpoint_path itself
+    # (relative to the poker_rl_lab package root unless absolute).
+    checkpoint_dir: str | None = None
 
 
 @dataclass(frozen=True)
 class EvaluatorConfig:
     type: str
     params: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ActionMapEntry:
+    """
+    One Trainer-level action string's mapping onto the RL Lab's abstract
+    ActionType vocabulary (poker_rl_lab.actions.abstract_action.ActionType),
+    plus — for bet-like actions — how TrainerService should size the
+    concrete engine Action it builds (see trainer_service.py's
+    _build_engine_action).
+
+    abstract : str
+        The abstract action's name, e.g. "bet_100", "fold", "all_in".
+        Must be a name NUM_ACTIONS/ActionType actually defines.
+    sizing : str | None
+        How this action's bet amount is computed. One of:
+          - None        : not a bet-like action (fold/check/call/all_in) —
+                           sizing is either meaningless or already fully
+                           determined by the engine itself.
+          - "pot"        : sized to `pot_fraction` * the current pot,
+                           capped at the player's stack. 1.0 = pot-sized.
+          - "stack"      : sized to the player's ENTIRE remaining stack —
+                           a true shove — regardless of pot size.
+        Per-scenario, not hardcoded: a river-style scenario training
+        pot-bet-or-check decisions declares "pot"; a scenario meant to
+        train shove-or-check decisions (where "bet" should always commit
+        the whole stack, independent of how big the dead pot happens to
+        be) declares "stack" instead — see training_config.yaml's
+        river_duo / double_board_plo_river_duo entries for both.
+    pot_fraction : float | None
+        Required (and only meaningful) when sizing == "pot". Ignored
+        when sizing == "stack".
+
+    A scenario offering a second bet size (e.g. half-pot alongside a
+    full shove) declares a SECOND Trainer-level action name (e.g.
+    "bet_half") with its own ActionMapEntry(abstract="bet_50",
+    sizing="pot", pot_fraction=0.5) — no code change needed anywhere in
+    trainer_service.py for that to work.
+    """
+    abstract: str
+    sizing: str | None = None
+    pot_fraction: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.sizing not in (None, "pot", "stack"):
+            raise ValueError(
+                f"ActionMapEntry.sizing must be None, 'pot', or 'stack' — "
+                f"got {self.sizing!r} (abstract={self.abstract!r})"
+            )
+        if self.sizing == "pot" and self.pot_fraction is None:
+            raise ValueError(
+                f"ActionMapEntry(abstract={self.abstract!r}) declares "
+                f"sizing='pot' but no pot_fraction — a pot-sized bet "
+                f"needs a fraction (1.0 = pot-sized)."
+            )
+
+
+# Every scenario that predates action_map (push_fold_duo) only ever uses
+# action names that are ALREADY valid abstract ActionType names 1:1
+# (fold/call/check/all_in — no scenario before "bet" existed used a name
+# that needed translating), so this default just maps each declared
+# action's Trainer name onto ITSELF as the abstract name with no bet
+# sizing. Any scenario introducing "bet" (or any other name that isn't
+# already an abstract ActionType name) MUST declare its own action_map
+# in training_config.yaml — see river_duo's entry for the pattern.
+def _default_action_map(actions: dict[str, list[str]]) -> dict[str, ActionMapEntry]:
+    names: set[str] = set()
+    for action_list in actions.values():
+        names.update(action_list)
+    return {name: ActionMapEntry(abstract=name) for name in names}
+
+
+def _parse_action_map(raw: dict | None, actions: dict[str, list[str]]) -> dict[str, ActionMapEntry]:
+    if not raw:
+        return _default_action_map(actions)
+    parsed = {}
+    for trainer_name, entry_raw in raw.items():
+        if isinstance(entry_raw, str):
+            # Shorthand: `fold: fold` — a non-bet action with no sizing
+            # to spell out.
+            parsed[trainer_name] = ActionMapEntry(abstract=entry_raw)
+            continue
+
+        sizing = entry_raw.get("sizing")
+        pot_fraction = entry_raw.get("pot_fraction")
+        if sizing is None and pot_fraction is not None:
+            # Backward-compat shorthand: a bare `pot_fraction` with no
+            # explicit `sizing` key implies sizing: pot (this was the
+            # only mode that existed before `sizing` was introduced).
+            sizing = "pot"
+
+        parsed[trainer_name] = ActionMapEntry(
+            abstract=entry_raw["abstract"],
+            sizing=sizing,
+            pot_fraction=pot_fraction,
+        )
+    return parsed
 
 
 @dataclass(frozen=True)
@@ -115,7 +218,51 @@ class ScenarioConfig:
     policy: PolicyConfig
     evaluator: EvaluatorConfig
     actions: dict[str, list[str]]
+    action_map: dict[str, ActionMapEntry]
     pot_bb: PotRange | None = None
+
+    def abstract_to_trainer_action(self, abstract_name: str) -> str | None:
+        """
+        Reverse lookup through this scenario's own action_map: abstract
+        ActionType name -> Trainer-level action string, or None if this
+        scenario never declares an action mapping onto that abstract
+        name. Computed on demand (action_map is small, called
+        infrequently — no need to cache) rather than duplicating this
+        loop at every trainer_service.py call site.
+        """
+        for trainer_name, entry in self.action_map.items():
+            if entry.abstract == abstract_name:
+                return trainer_name
+        return None
+
+    def trainer_to_abstract(self, trainer_name: str) -> str | None:
+        entry = self.action_map.get(trainer_name)
+        return entry.abstract if entry else None
+
+    def is_bet_like(self, trainer_name: str) -> bool:
+        """True if this scenario's action_map declares `trainer_name`
+        as a bet-like action (sizing is "pot" or "stack") — the
+        general replacement for any hardcoded `== "bet"` check."""
+        entry = self.action_map.get(trainer_name)
+        return entry is not None and entry.sizing is not None
+
+    def sizing_for(self, trainer_name: str) -> str | None:
+        entry = self.action_map.get(trainer_name)
+        return entry.sizing if entry else None
+
+    def pot_fraction_for(self, trainer_name: str) -> float | None:
+        entry = self.action_map.get(trainer_name)
+        return entry.pot_fraction if entry else None
+
+    def bet_like_actions(self) -> list[str]:
+        """Every Trainer-level action name this scenario declares as
+        bet-like (sizing is "pot" or "stack"), e.g. ["bet"], or
+        ["bet_half", "bet_pot"] for a scenario offering more than one
+        size. Order follows action_map's own declaration order."""
+        return [
+            name for name, entry in self.action_map.items()
+            if entry.sizing is not None
+        ]
 
 
 def _parse_scenario(key: str, raw: dict) -> ScenarioConfig:
@@ -144,12 +291,14 @@ def _parse_scenario(key: str, raw: dict) -> ScenarioConfig:
             encoder_embedding_dim=policy_raw.get("encoder_embedding_dim"),
             variant=policy_raw.get("variant", "shared_trunk_two_heads"),
             allow_untrained_fallback=policy_raw.get("allow_untrained_fallback", True),
+            checkpoint_dir=_resolve_rl_lab_path(policy_raw.get("checkpoint_dir")),
         ),
         evaluator=EvaluatorConfig(
             type=evaluator_raw["type"],
             params=evaluator_raw.get("params", {}),
         ),
         actions=raw.get("actions", {}),
+        action_map=_parse_action_map(raw.get("action_map"), raw.get("actions", {})),
         pot_bb=(
             PotRange(min=float(pot_raw["min"]), max=float(pot_raw["max"]))
             if pot_raw
