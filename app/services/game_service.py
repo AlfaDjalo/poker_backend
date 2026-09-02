@@ -1,35 +1,82 @@
-# import sys
-# from pathlib import Path
-# project_root = Path(__file__).resolve().parents[3]
-# engine_root = project_root / "poker_engine"
+"""
+app/services/game_service.py — GameService, running entirely on
+GraphEngine. Rewritten against the confirmed migration doc ("Backend
+migration: PokerState -> GraphEngine").
 
-# if str(engine_root) not in sys.path:
-#     sys.path.insert(0, str(engine_root))
+Import paths (previous revision guessed several of these wrong —
+corrected here per the doc's "Load"/"Run a hand" code blocks):
+    from poker_engine.rules.graph_loader import load_game_graph
+    from poker_engine.graph.graph_engine import GraphEngine
+    from poker_engine.graph.hand_session import new_hand_state, start_new_hand
+    from poker_engine.graph.callbacks import submit_decision
+    from poker_engine.graph.core_types import DecisionResponse
+    from poker_engine.showdown.showdown_resolver import ShowdownResolver
+    from poker_engine.scoring.scoring_engine import CppScoringEngine
+    from poker_engine.cards.deck import Deck
+
+Dealer rotation
+------------------
+new_hand_state(players, game_def, dealer_position=0) takes an explicit
+starting dealer_position; start_new_hand(...) does the per-hand
+rotation itself UNLESS advance_dealer=False is passed — the doc notes
+"advance_dealer=False for hand 1 if dealer_position is already set"
+(otherwise hand 1 would rotate away from the dealer_position we just
+explicitly set). self._dealer_position tracks the last known position
+(read back off engine state after every start_new_hand call) so a
+variant switch mid-session (which rebuilds hand_state from scratch)
+can hand the new hand_state a sensible starting position instead of
+silently resetting to seat 0.
+
+Decision construction
+------------------------
+Per the doc's "Run a hand" loop:
+    req = engine.pending_request
+    response = DecisionResponse(req.node_id, req.domain, req.player_index, value)
+    submit_decision(engine, response, callbacks=cb)
+
+`value`'s exact shape is still unconfirmed — _build_decision_response()
+below constructs it as {"action_type": ..., "amount": ...} and matches
+it against `req.options` by action_name, since that's the minimum any
+DecisionResponse consumer would need to identify which legal option
+was chosen. Flagged in that function's own docstring; update it there
+if the real `value` shape turns out to be the option object itself (or
+something else) rather than a plain dict.
+
+Hand Editor is NOT carried forward — see the previous revision's
+docstring for why (still true: no GraphEngine-native snapshot/restore
+mechanism exists per the doc's "Behavioral differences" section).
+
+get_variant_config()'s flow-walking (_summarize_flow) is unchanged
+from the previous revision and still speculative pending confirmation
+of graph.node(...)'s metadata key names — see that function's own
+ASSUMPTIONS block.
+"""
 
 from importlib import resources
 from pathlib import Path
 
-from poker_engine.actions.action import Action
-from poker_engine.actions.action_type import ActionType
-from poker_engine.cards.card import Card as CardObj
-from poker_engine.cards.mask import mask_to_card_ids
-from poker_engine.games.loader import load_game
 from poker_engine.scoring.scoring_engine import CppScoringEngine
 from poker_engine.state.player_state import PlayerState
-from poker_engine.state.poker_state import Phase, PokerState
+from poker_engine.cards.deck import Deck as GraphDeck
 
-from app.db.models.actions import Action as ActionModel
-from app.db.models.board_cards import BoardCard as BoardCardModel
-from app.db.models.hand_points import HandPoint as HandPointModel
-from app.db.models.hands import Hand as HandModel
-from app.db.models.hole_cards import HoleCard as HoleCardModel
-from app.db.models.payouts import Payout as PayoutModel
+from poker_engine.rules.graph_loader import load_game_graph
+from poker_engine.graph.graph_engine import GraphEngine
+from poker_engine.graph.hand_session import new_hand_state, start_new_hand
+from poker_engine.graph.callbacks import submit_decision
+from poker_engine.graph.core_types import DecisionResponse
+from poker_engine.showdown.showdown_resolver import ShowdownResolver
+
 from app.db.models.players import Player
-from app.db.models.point_cards import PointCard as PointCardModel
-from app.db.models.point_results import PointResult as PointResultModel
 from app.db.models.poker_tables import PokerTable
-from app.engine_adapter import state_to_dto
-from app.services.engine_callbacks import BackendEngineCallbacks
+from poker_engine.actions.action import Action as EngineAction
+
+from app.graph_engine_adapter import (
+    graph_state_to_dto,
+    _game_obj,
+    _option_action_name,
+    _option_action_type_enum,
+)
+from app.services.graph_engine_callbacks import BackendGraphEngineCallbacks
 from app.services.session_logger import SessionLogger
 
 DEFAULT_GAME = "holdem"
@@ -38,11 +85,23 @@ DEFAULT_GAME = "holdem"
 class GameService:
 
     def __init__(self):
-        self.state = None
+        self.engine = None
+        self.graph = None
+        self.game_def = None
+        self.rules = None
         self.logger = None
-        self.callback = None
+        self.graph_callbacks = None
+
         self.current_game = DEFAULT_GAME
         self.pending_game = None
+
+        # Last known dealer_position, read back off engine state after
+        # every start_new_hand() call — see module docstring.
+        self._dealer_position = 0
+
+        # Hand Editor state — kept as attributes so edit_api.py's
+        # existing shape doesn't need to change even though the
+        # methods below just raise NotImplementedError.
         self.editing_mode = False
         self.pre_edit_snapshot = None
 
@@ -57,77 +116,34 @@ class GameService:
         if not games_dir.exists():
             return {"variants": [], "current": self.current_game}
 
-        # games_dir = engine_root / "games"
-        # if not games_dir.exists():
-        #     return {"variants": [], "current": self.current_game}
-
         names = sorted(p.stem for p in games_dir.glob("*.yaml"))
-        # print("Variants: ", names)
         return {"variants": names, "current": self.current_game}
 
     def get_variant_config(self, game_name: str):
         """
-        Read the raw variant YAML and project out the fields the Hand
-        Creation wizard needs: hole_cards, board_layout, creation_phases.
-
-        Returns None if the variant YAML doesn't exist.
+        Replaces the old board_layout/betting/creation_phases YAML
+        projection with an equivalent derived from the real graph —
+        see _summarize_flow()'s ASSUMPTIONS. Returns None if the
+        variant doesn't exist / fails to load.
         """
-        import yaml
-
-        games_dir = Path(str(resources.files("poker_engine") / "games"))
-        # if not games_dir.exists():
-        #     return {"variants": [], "current": self.current_game}
-
-        # games_dir = engine_root / "games"
-        yaml_path = games_dir / f"{game_name}.yaml"
-        if not yaml_path.exists():
+        try:
+            game_def, rules, graph = load_game_graph(game_name)
+        except FileNotFoundError:
             return None
 
-        with open(yaml_path, "r") as f:
-            raw = yaml.safe_load(f) or {}
-
-        board_layout = raw.get("board_layout", {}) or {}
-        betting = raw.get("betting", {}) or {}
-
-        return {
-            "game_name": raw.get("game_name", game_name),
-            "layout_name": raw.get("layout_name", board_layout.get("name")),
-            "hole_cards": raw.get("hole_cards"),
-            "board_layout": {
-                "nodes": board_layout.get("nodes"),
-                "streets": board_layout.get("streets", {}),
-                "street_names": board_layout.get("street_names", {}),
-            },
-            "betting": {
-                "type": betting.get("type"),
-                "small_blind": betting.get("small_blind"),
-                "big_blind": betting.get("big_blind"),
-                "ante": betting.get("ante", 0),
-            },
-            "creation_phases": raw.get("creation_phases", []),
-        }
+        return _summarize_flow(game_def, rules, graph)
 
     # --------------------------------------------------
     # Game selection (queued; applied between hands only)
     # --------------------------------------------------
 
     def select_game(self, game_name: str):
-        """
-        Queue a game change. Applied at the start of the next hand or on
-        a full restart. Raises ValueError if the variant doesn't exist.
-        """
         games_dir = Path(str(resources.files("poker_engine") / "games"))
-
-        # if not games_dir.exists():
-
-        # games_dir = engine_root / "games"
         if not (games_dir / f"{game_name}.yaml").exists():
             raise ValueError(f"Unknown game variant: '{game_name}'")
-
         self.pending_game = game_name
 
     def _apply_pending_game(self, game_name: str | None = None):
-        """Consume any explicit or queued game selection and return it."""
         if game_name:
             self.select_game(game_name)
         if self.pending_game:
@@ -136,11 +152,10 @@ class GameService:
         return self.current_game
 
     # --------------------------------------------------
-    # Session restart (re-creates PokerState)
+    # Session restart
     # --------------------------------------------------
 
     def restart(self, db, game_name: str | None = None):
-
         self._apply_pending_game(game_name)
 
         active_table = db.query(PokerTable).first()
@@ -153,25 +168,33 @@ class GameService:
             .order_by(Player.username)
             .all()
         )
-
         if len(db_players) < 6:
             raise Exception(f"Found only {len(db_players)} players.")
 
         players = [PlayerState(stack=100) for _ in db_players]
 
-        game_def, rules = load_game(self.current_game)
-
-        # print("GameDef: ", game_def)
-        # print("Game variant: ", self.current_game)
-
-        scoring_engine = CppScoringEngine()
+        game_def, rules, graph = load_game_graph(self.current_game)
 
         self.logger = SessionLogger(db)
-        self.callbacks = BackendEngineCallbacks(self.logger, game_service_ref=self)
-
-        self.state = PokerState(
-            players, game_def, rules, scoring_engine, callbacks=self.callbacks
+        self.graph_callbacks = BackendGraphEngineCallbacks(
+            self.logger, game_service_ref=self
         )
+
+        self._dealer_position = 0
+        hand_state = new_hand_state(players, game_def, dealer_position=self._dealer_position)
+        deck = GraphDeck()
+        showdown_resolver = ShowdownResolver(CppScoringEngine(), rules)
+
+        self.engine = GraphEngine(graph, hand_state, deck, showdown_resolver=showdown_resolver)
+        self.engine.game_def = game_def   # <-- add this
+        self.graph = graph
+        self.game_def = game_def
+        self.rules = rules
+
+        # self.engine = GraphEngine(graph, hand_state, deck, showdown_resolver=showdown_resolver)
+        # self.graph = graph
+        # self.game_def = game_def
+        # self.rules = rules
 
         self.logger.start_game(
             {
@@ -180,363 +203,447 @@ class GameService:
             }
         )
 
-        self.state.start_hand()
+        # First hand: dealer_position was just explicitly set above,
+        # so don't let start_new_hand rotate it again — see module
+        # docstring.
+        start_new_hand(
+            self.engine, game_def, callbacks=self.graph_callbacks, advance_dealer=False
+        )
+        self._sync_dealer_position()
 
-        # self.logger.start_hand({
-        #     "variant_name": game_def.game_name,
-        #     "layout_name": game_def.layout_name,
-        #     "split_pot": (rules.payout_type == "split_pot"),
-        #     "betting_config_id": 1,
-        #     "dealer_seat": 0,
-        #     "pot": 0,
-        #     "ended_at": None,
-        #     "game_def": game_def,
-        #     "players": self.state.game.players
-        # })
+        return graph_state_to_dto(self.engine, game_def, rules, graph=self.graph)
 
-        return state_to_dto(self.state)
+    def _sync_dealer_position(self):
+        try:
+            self._dealer_position = _game_obj(self.engine).dealer_position
+        except Exception:
+            pass
 
     # --------------------------------------------------
     # State
     # --------------------------------------------------
 
     def get_state(self):
-
-        if self.state is None:
+        if self.engine is None:
             return None
-
-        return state_to_dto(self.state)
+        return graph_state_to_dto(self.engine, self.game_def, self.rules, graph=self.graph)
 
     # --------------------------------------------------
     # Player actions
     # --------------------------------------------------
 
     def apply_action(self, req):
-
-        if self.state is None:
+        if self.engine is None:
             return None
 
-        action = to_engine_action(req)
-        self.state.step(action)
+        response, player_index = _build_decision_response(self.engine, req)
 
-        return self._progress_engine()
+        if self.graph_callbacks is not None and player_index is not None:
+            self.graph_callbacks.note_pre_decision(self.engine, player_index)
+
+        submit_decision(self.engine, response, callbacks=self.graph_callbacks)
+
+        return graph_state_to_dto(self.engine, self.game_def, self.rules, graph=self.graph)
 
     def advance_street(self):
-        if self.state is None:
-            return None
-
-        self.state.step(None)
-
-        return state_to_dto(self.state)
-
-    def _progress_engine(self):
-        """
-        Automatically advance non-player phases:
-        - DEAL_BOARD
-        """
-
-        while self.state.phase == Phase.DEAL_BOARD:
-            self.state.step(None)
-
-        dto = state_to_dto(self.state)
-
-        if self.state.phase in [Phase.SHOWDOWN, Phase.HAND_COMPLETE]:
-            dto.winners = self._get_winners()
-
-        return dto
+        """GraphEngine advances streets internally via the graph itself
+        — no caller-driven pump loop needed. Kept as a no-op
+        passthrough only so game_api.py's existing route doesn't need
+        touching."""
+        return self.get_state()
 
     # --------------------------------------------------
     # New hand (within the same session)
     # --------------------------------------------------
 
-    def _build_continuation_players(self):
-        return [PlayerState(stack=p.stack) for p in self.state.game.players]
-
-    def _recreate_state_with_variant(self, game_def, rules):
-        if self.state is None:
-            raise RuntimeError("No active game session. Call /game/restart first.")
-
-        self.state = PokerState(
-            self._build_continuation_players(),
-            game_def,
-            rules,
-            CppScoringEngine(),
-            callbacks=self.callbacks,
-        )
-
     def new_hand(self, game_name: str | None = None):
         """
-        Start a new hand.  If game_name is supplied (or a pending_game is
+        Start a new hand. If game_name is supplied (or a pending_game is
         queued) the variant is switched before dealing.
-
-        Note: the API/frontend is responsible for only calling this once the
-        previous hand is HAND_COMPLETE; we don't gate it here.
         """
         self._apply_pending_game(game_name)
 
-        game_def, rules = load_game(self.current_game)
+        if self.engine is None:
+            raise RuntimeError("No active game session. Call /game/restart first.")
 
-        if self.state is None:
-            raise RuntimeError("No active game state. Call /game/restart first.")
+        game_def, rules, graph = load_game_graph(self.current_game)
 
-        if self.state.game_def.game_name != game_def.game_name:
-            self._recreate_state_with_variant(game_def, rules)
-        else:
-            self.state.game_def = game_def
-            self.state.rules = rules
+        if self.game_def is None or self.game_def.game_name != game_def.game_name:
+            players = [PlayerState(stack=p.stack) for p in _game_obj(self.engine).players]
+            hand_state = new_hand_state(
+                players, game_def, dealer_position=self._dealer_position
+            )
+            deck = GraphDeck()
+            showdown_resolver = ShowdownResolver(CppScoringEngine(), rules)
+            self.engine = GraphEngine(
+                graph, hand_state, deck, showdown_resolver=showdown_resolver
+            )
+            self.engine.game_def = game_def   # <-- add this
+            self.graph = graph
+            # self.engine = GraphEngine(
+            #     graph, hand_state, deck, showdown_resolver=showdown_resolver
+            # )
+            # self.graph = graph
 
-        self.state.start_hand()
+        self.game_def = game_def
+        self.rules = rules
 
-        return state_to_dto(self.state)
+        # Continuing hand (same or switched variant, same session) —
+        # let the button rotate normally.
+        start_new_hand(self.engine, game_def, callbacks=self.graph_callbacks)
+        self._sync_dealer_position()
+
+        return graph_state_to_dto(self.engine, game_def, rules, graph=self.graph)
 
     # --------------------------------------------------
-    # Helpers
+    # Hand Editor — not carried forward, see module docstring.
     # --------------------------------------------------
-
-    def _get_winners(self):
-        return [w + 1 for w in self.state.last_winners]
 
     def begin_edit(self, db):
-        """
-        Enter editing mode.
-        - Saves an in-memory snapshot of current PokerState
-        - Deletes DB records for the current hand
-        - Sets editing_mode = True so subsequent action callbacks skip logging
-        """
-        if self.state is None:
-            raise RuntimeError("No active game state.")
-
-        # Snapshot current state for cancel support
-        self.pre_edit_snapshot = self._snapshot_state()
-        self.editing_mode = True
-
-        # Delete DB records for the current hand
-        if self.logger and self.logger.hand_id:
-            self._delete_hand_records(db, self.logger.hand_id)
+        raise NotImplementedError(
+            "Hand editing has no GraphEngine-native snapshot/restore "
+            "mechanism yet — see game_service.py's module docstring."
+        )
 
     def apply_edit(self, req):
-        """Apply an edited snapshot to the live game and resume."""
-        if not self.editing_mode:
-            raise RuntimeError("Not in editing mode. Call /game/edit/begin first.")
-
-        self._validate_edit_request(req)
-        self._load_snapshot_from_request(req)
-        self.editing_mode = False
-        self.pre_edit_snapshot = None
-
-        return self._progress_engine()
+        raise NotImplementedError(
+            "Hand editing has no GraphEngine-native snapshot/restore "
+            "mechanism yet — see game_service.py's module docstring."
+        )
 
     def load_edit(self, req):
-        """
-        Load an arbitrary snapshot (from Replayer).
-        Marks as editing_mode so the hand is never saved.
-        """
-        self._validate_edit_request(req)
-
-        game_def, rules = load_game(req.game_name)
-
-        players = [PlayerState(stack=p.stack) for p in req.players]
-
-        self.state = PokerState(
-            players,
-            game_def,
-            rules,
-            CppScoringEngine(),
-            callbacks=self.callbacks,
+        raise NotImplementedError(
+            "Hand editing has no GraphEngine-native snapshot/restore "
+            "mechanism yet — see game_service.py's module docstring."
         )
-
-        self._apply_snapshot_to_state(req)
-        self.editing_mode = True
-
-        return state_to_dto(self.state)
 
     def cancel_edit(self):
-        """Restore the snapshot taken at begin_edit."""
-        if self.pre_edit_snapshot is None:
-            raise RuntimeError("No pre-edit snapshot available.")
+        raise NotImplementedError(
+            "Hand editing has no GraphEngine-native snapshot/restore "
+            "mechanism yet — see game_service.py's module docstring."
+        )
 
-        self._restore_snapshot(self.pre_edit_snapshot)
-        self.editing_mode = False
-        self.pre_edit_snapshot = None
 
-        return state_to_dto(self.state)
+# --------------------------------------------------------------------
+# Decision construction — see module docstring's "Decision
+# construction" section.
+# --------------------------------------------------------------------
 
-    # ── Snapshot helpers ──────────────────────────────────────────────
 
-    def _snapshot_state(self):
-        """Capture a minimal dict snapshot of the current PokerState."""
-        g = self.state.game
+def _build_decision_response(engine, req_body):
+    """
+    Build a DecisionResponse(node_id, domain, player_index, value) for
+    the pending decision, dispatching on pending.domain — see each
+    per-domain builder below for its own value-shape docstring. Only
+    BETTING was previously supported (see module docstring's original
+    note on this function); CARD_SELECT / CARD_PASS / BOOLEAN / CHOICE
+    are new — added so non-betting variants (Drawmaha-style
+    discard/redraw, pass-the-trash, Grinch-style yes/no decisions) can
+    actually reach the engine, now that ActionRequest (game_api.py)
+    carries the extra fields each of those needs.
+
+    Returns (response, player_index) in every case — player_index is
+    handed back separately so the caller can pass it to
+    BackendGraphEngineCallbacks.note_pre_decision() without re-reading
+    pending_request itself.
+    """
+    pending = engine.pending_request
+    if pending is None:
+        raise ValueError("No decision is currently pending.")
+
+    domain_name = getattr(pending.domain, "name", str(pending.domain))
+
+    if domain_name == "BETTING":
+        return _build_betting_decision_response(engine, pending, req_body)
+    if domain_name in ("CARD_SELECT", "CARD_PASS"):
+        return _build_card_select_decision_response(engine, pending, req_body)
+    if domain_name == "BOOLEAN":
+        return _build_boolean_decision_response(engine, pending, req_body)
+    if domain_name == "CHOICE":
+        return _build_choice_decision_response(engine, pending, req_body)
+
+    raise ValueError(
+        f"Unsupported decision domain: {domain_name!r} — no response "
+        f"builder wired up for it in game_service.py."
+    )
+
+
+def _build_betting_decision_response(engine, pending, req_body):
+    if not req_body.type:
+        raise ValueError(
+            "BETTING decision requires 'type' (fold/check/call/bet/raise/all_in)."
+        )
+    action_type = req_body.type.lower()
+    amount = req_body.amount
+
+    # The engine names the SAME bet-sizing button "bet" when opening the
+    # street (nothing owed yet) and "raise" when facing a bet already
+    # (e.g. SB opening over a posted BB is legally a raise, not a bet) —
+    # see betting_rules.py's boundary-action semantics (§2.3). The
+    # frontend's sizing control has no reliable way to know which one
+    # the engine will call it this decision (PlayerActionPanel.handleBet
+    # picks the DISPLAY label off player.bet, a client-side heuristic —
+    # see the Frontend doc's own note on that quirk) and always submits
+    # type: "bet" regardless. Treat "bet"/"raise" as synonyms here so a
+    # legal bet-like action is matched by whichever name the engine
+    # actually gave it, instead of raising "not among the legal options"
+    # any time the two labels disagree.
+    _ACTION_SYNONYMS = {"bet": {"bet", "raise"}, "raise": {"bet", "raise"}}
+    candidate_names = _ACTION_SYNONYMS.get(action_type, {action_type})
+
+    options = getattr(pending, "options", ()) or ()
+    matching = None
+    for opt in options:
+        name = _option_action_name(opt)
+        if name is not None and name in candidate_names:
+            matching = opt
+            break
+
+    if matching is None:
+        legal = [_option_action_name(o) for o in options]
+        raise ValueError(
+            f"Action {action_type!r} is not among the legal options right now "
+            f"(legal: {legal})"
+        )
+
+    # BettingResolver.validate() requires response.value to be a real
+    # poker_engine.actions.action.Action — a plain {"action_type":...,
+    # "amount":...} dict (the previous shape here) raises "response.value
+    # must be an Action, got <class 'dict'>" the instant a hero submits
+    # anything. Build the real thing, using the SAME enum the matched
+    # option itself carries (via _option_action_type_enum) rather than
+    # re-deriving it from the lowercase action_type string, so this can
+    # never disagree with what _options_to_dto told the frontend was
+    # legal in the first place.
+    engine_action_type = _option_action_type_enum(matching)
+    if engine_action_type is None:
+        raise ValueError(
+            f"Could not resolve an engine ActionType for option "
+            f"{action_type!r} — matched option has no recognizable "
+            f"action-identity field (see _option_raw_action_value)."
+        )
+
+    # amount semantics mirror Action's own docstring (§2.2): CALL's
+    # amount is the amount to call — and BettingResolver.validate()
+    # enforces it exactly (legal range collapses to [to_call, to_call],
+    # confirmed by "Action amount 0 outside legal range [6, 6] for
+    # ActionType.CALL" once a client omits it); BET/RAISE's amount is
+    # the TOTAL target bet for the street; FOLD/CHECK ignore amount
+    # entirely. The frontend only ever sends an explicit amount for
+    # bet-like actions (see PlayerActionPanel.handleBet) — fold/check/
+    # call/all_in submit none. Previously this defaulted a missing
+    # amount straight to 0, which is correct for fold/check but wrong
+    # for call/all_in, whose legal amount is a real, engine-computed
+    # value that happens to live on the matched option itself
+    # (min_amount == max_amount for these). Fall back to that instead
+    # of a bare 0 whenever the client didn't supply one.
+    option_min = getattr(matching, "min_amount", None)
+    if amount is None:
+        amount = option_min if option_min is not None else 0
+
+    value = EngineAction(
+        type=engine_action_type,
+        amount=amount,
+    )
+    player_index = getattr(pending, "player_index", None)
+
+    response = DecisionResponse(pending.node_id, pending.domain, player_index, value)
+    return response, player_index
+
+
+def _build_card_select_decision_response(engine, pending, req_body):
+    """
+    CARD_SELECT (discard/draw, e.g. Drawmaha) and CARD_PASS
+    (pass-the-trash) both take `value: Tuple[int, ...]` — the card ids
+    the player is choosing from their own hand (§2.9.1 core_types.py:
+    "CARD_SELECT/CARD_PASS -> Tuple[int,...]"). CARD_PASS's target
+    seat is NOT part of the response — it's resolved automatically by
+    CardPassResolver from a fixed config rule ("left"/"right"), so the
+    frontend never chooses one; only which cards to send.
+
+    req_body.selected_cards carries the player's chosen cards as
+    strings ("Ah", "2c", ...) — the same string format used
+    everywhere else in this API (hole_cards, node_cards, etc.).
+    Converted to engine card ids via Card.from_str().
+
+    Count/eligibility (min_count/max_count, which zone the cards must
+    come from) is NOT re-validated here — CardSelectResolver.apply()
+    re-validates the response against a freshly rebuilt DecisionRequest
+    before mutating any state (per its own contract, shared by every
+    resolver — see graph docs §2.9.6), so an illegal selection is
+    rejected by the engine itself with a real error rather than
+    silently accepted or re-checked twice.
+    """
+    from poker_engine.cards.card import Card as CardObj
+
+    if req_body.selected_cards is None:
+        raise ValueError(
+            "CARD_SELECT/CARD_PASS decision requires 'selected_cards' "
+            "(a list of card strings, e.g. ['Ah', '2c'] — pass an empty "
+            "list [] to stand pat / select zero cards when the pending "
+            "option's min_count is 0)."
+        )
+
+    try:
+        card_ids = tuple(
+            CardObj.from_str(c).id for c in req_body.selected_cards
+        )
+    except Exception as exc:
+        raise ValueError(f"Invalid card string in selected_cards: {exc}")
+
+    player_index = getattr(pending, "player_index", None)
+    response = DecisionResponse(pending.node_id, pending.domain, player_index, card_ids)
+    return response, player_index
+
+
+def _build_boolean_decision_response(engine, pending, req_body):
+    """BOOLEAN (e.g. Grinch's "Christmas next street?") takes a plain
+    bool as value — see core_types.py's DecisionResponse.value table."""
+    if req_body.bool_value is None:
+        raise ValueError("BOOLEAN decision requires 'bool_value' (true/false).")
+
+    player_index = getattr(pending, "player_index", None)
+    response = DecisionResponse(
+        pending.node_id, pending.domain, player_index, bool(req_body.bool_value)
+    )
+    return response, player_index
+
+
+def _build_choice_decision_response(engine, pending, req_body):
+    """
+    CHOICE takes the chosen option's action_name as a plain string
+    value (see core_types.py's DecisionResponse.value table). Matched
+    against pending.options by action_name first, same legality check
+    the BETTING builder does, so an illegal/unknown choice is rejected
+    here with a clear error rather than reaching ChoiceResolver.apply()
+    and failing there with less context.
+    """
+    if not req_body.choice:
+        raise ValueError("CHOICE decision requires 'choice'.")
+
+    options = getattr(pending, "options", ()) or ()
+    valid_names = {_option_action_name(o) for o in options}
+    if req_body.choice not in valid_names:
+        raise ValueError(
+            f"Choice {req_body.choice!r} is not among the legal options "
+            f"right now (legal: {sorted(n for n in valid_names if n)})"
+        )
+
+    player_index = getattr(pending, "player_index", None)
+    response = DecisionResponse(
+        pending.node_id, pending.domain, player_index, req_body.choice
+    )
+    return response, player_index
+
+
+# --------------------------------------------------------------------
+# Flow summarization for get_variant_config() — unchanged from the
+# previous revision; still speculative. See its own ASSUMPTIONS block.
+# --------------------------------------------------------------------
+
+
+def _summarize_flow(game_def, rules, graph):
+    """
+    ASSUMPTIONS (unconfirmed against real graph-module source):
+      - graph has a `.start_node` attribute (or `.root`/`.entry` —
+        tried in that order) giving the first node id.
+      - graph.node(node_id) returns an object with `.domain` (for
+        DECISION nodes, e.g. "BETTING") and `.metadata` (dict) — per
+        the migration doc's confirmed mapping.
+      - graph.outgoing(node_id) returns an iterable of next node ids
+        (or (condition, next_id) pairs for the transitions: override
+        path) — this walk only follows the FIRST outgoing edge, since
+        it just needs one representative pass through the flow for
+        wizard display, not full branch enumeration.
+      - A node's metadata dict may contain `deals_hole` (bool),
+        `deals_board_street` (int | None), `street_name` (str | None)
+        — mirroring the old creation_phases YAML block's own field
+        names. If the real metadata uses different keys, only the
+        `.get(...)` calls below need updating.
+      - hole_cards total is derived by summing metadata.get(
+        "card_count", 1) across every node with deals_hole truthy.
+
+    Cycle-safe: stops walking a branch the moment it revisits a node
+    id (betting's own loop branch would otherwise spin forever).
+    """
+    start = (
+        getattr(graph, "start_node", None)
+        or getattr(graph, "root", None)
+        or getattr(graph, "entry", None)
+    )
+
+    if start is None:
         return {
-            "game_name": self.current_game,
-            "street_index": g.street_index,
-            "pot": g.pot,
-            "dealer_position": g.dealer_position,
-            "current_player": g.current_player,
-            "bet_to_call": g.bet_to_call,
-            "min_raise": g.min_raise,
-            "node_cards": list(g.node_cards),
-            "discard_pile": list(getattr(g, "discard_pile", [])),
-            "players": [
-                {
-                    "stack": p.stack,
-                    "hand_mask": p.hand_mask,
-                    "current_bet": p.current_bet,
-                    "total_contribution": getattr(p, "total_contribution", 0),
-                    "has_folded": p.has_folded,
-                    "is_all_in": getattr(p, "is_all_in", False),
-                }
-                for p in g.players
-            ],
+            "game_name": getattr(game_def, "game_name", None),
+            "layout_name": getattr(game_def, "layout_name", None),
+            "hole_cards": None,
+            "board_layout": {
+                "nodes": getattr(game_def, "node_count", None),
+                "streets": {},
+                "street_names": {},
+            },
+            "creation_phases": [],
         }
 
-    def _restore_snapshot(self, snap):
-        g = self.state.game
-        g.street_index = snap["street_index"]
-        g.pot = snap["pot"]
-        g.dealer_position = snap["dealer_position"]
-        g.current_player = snap["current_player"]
-        g.bet_to_call = snap["bet_to_call"]
-        g.min_raise = snap["min_raise"]
-        g.node_cards = snap["node_cards"]
-        if hasattr(g, "discard_pile"):
-            g.discard_pile = snap["discard_pile"]
-        for i, ps in enumerate(snap["players"]):
-            p = g.players[i]
-            p.stack = ps["stack"]
-            p.hand_mask = ps["hand_mask"]
-            p.current_bet = ps["current_bet"]
-            if hasattr(p, "total_contribution"):
-                p.total_contribution = ps["total_contribution"]
-            p.has_folded = ps["has_folded"]
-            if hasattr(p, "is_all_in"):
-                p.is_all_in = ps["is_all_in"]
+    creation_phases = []
+    hole_cards_total = 0
+    streets: dict[int, list[int]] = {}
+    street_names: dict[int, str] = {}
 
-    def _apply_snapshot_to_state(self, req):
-        """Write an EditStateRequest into the live PokerState."""
-        g = self.state.game
-        g.street_index = req.street_index
-        g.pot = req.pot
-        g.dealer_position = req.dealer_position
-        g.current_player = req.current_player
-        g.bet_to_call = req.bet_to_call
-        g.min_raise = req.min_raise
+    visited = set()
+    current = start
+    idx = 0
 
-        # node cards
-        g.node_cards = [CardObj.from_str(c).id if c else None for c in req.node_cards]
+    while current is not None and current not in visited:
+        visited.add(current)
+        node = graph.node(current)
+        domain = getattr(node, "domain", None)
+        domain_name = getattr(domain, "name", str(domain)) if domain is not None else None
+        metadata = dict(getattr(node, "metadata", {}) or {})
 
-        # discard pile
-        if hasattr(g, "discard_pile"):
-            g.discard_pile = [CardObj.from_str(c).id for c in req.discard_pile]
+        deals_hole = bool(metadata.get("deals_hole", False))
+        deals_board_street = metadata.get("deals_board_street")
+        street_name = metadata.get("street_name")
+        allows_betting = domain_name == "BETTING"
 
-        # players
-        for p_input in req.players:
-            idx = p_input.seat - 1
-            if idx < 0 or idx >= len(g.players):
-                continue
-            p = g.players[idx]
-            p.stack = p_input.stack
-            p.current_bet = p_input.current_bet
-            if hasattr(p, "total_contribution"):
-                p.total_contribution = p_input.total_contribution
-            p.has_folded = p_input.has_folded
-            if hasattr(p, "is_all_in"):
-                p.is_all_in = p_input.is_all_in
-            # Rebuild hand_mask from hole_cards list
-            mask = 0
-            for cs in p_input.hole_cards:
-                if cs is not None:
-                    mask |= 1 << CardObj.from_str(cs).id
-            p.hand_mask = mask
+        if deals_hole:
+            hole_cards_total += int(metadata.get("card_count", 1))
 
-    def _load_snapshot_from_request(self, req):
-        """For apply_edit: load req into existing state (same game variant)."""
-        if self.state.game_def.game_name != req.game_name:
-            game_def, rules = load_game(req.game_name)
-            self._recreate_state_with_variant(game_def, rules)
-        self._apply_snapshot_to_state(req)
+        if deals_board_street is not None:
+            node_indices = metadata.get("node_indices", [])
+            streets.setdefault(int(deals_board_street), list(node_indices))
+            if street_name:
+                street_names[int(deals_board_street)] = street_name
 
-    def _validate_edit_request(self, req):
-        seen: set[str] = set()
-        errors = []
-        for p in req.players:
-            for c in p.hole_cards:
-                if c is None:
-                    continue
-                if c in seen:
-                    errors.append(f"Duplicate card: {c}")
-                seen.add(c)
-        for c in req.node_cards:
-            if c is None:
-                continue
-            if c in seen:
-                errors.append(f"Duplicate card: {c}")
-            seen.add(c)
-        for c in req.discard_pile:
-            if c in seen:
-                errors.append(f"Duplicate card: {c}")
-            seen.add(c)
-        if len(seen) > 52:
-            errors.append("More than 52 cards accounted for.")
-        if errors:
-            raise ValueError("; ".join(errors))
-
-    def _delete_hand_records(self, db, hand_id: int):
-        """Remove all DB rows for a hand that is being edited."""
-
-        # Delete in FK-safe order
-        point_ids = [
-            r[0]
-            for r in db.query(HandPointModel.point_id)
-            .filter(HandPointModel.hand_id == hand_id)
-            .all()
-        ]
-        if point_ids:
-            pr_ids = [
-                r[0]
-                for r in db.query(PointResultModel.point_result_id)
-                .filter(PointResultModel.point_id.in_(point_ids))
-                .all()
-            ]
-            if pr_ids:
-                db.query(PointCardModel).filter(
-                    PointCardModel.point_result_id.in_(pr_ids)
-                ).delete(synchronize_session=False)
-
-            db.query(PointResultModel).filter(
-                PointResultModel.point_id.in_(point_ids)
-            ).delete(synchronize_session=False)
-        db.query(PayoutModel).filter(PayoutModel.hand_id == hand_id).delete(
-            synchronize_session=False
+        creation_phases.append(
+            {
+                "id": metadata.get("id", f"NODE_{idx}"),
+                "deals_hole": deals_hole,
+                "deals_board_street": deals_board_street,
+                "allows_betting": allows_betting,
+            }
         )
-        db.query(HandPointModel).filter(HandPointModel.hand_id == hand_id).delete(
-            synchronize_session=False
-        )
-        db.query(ActionModel).filter(ActionModel.hand_id == hand_id).delete(
-            synchronize_session=False
-        )
-        db.query(HoleCardModel).filter(HoleCardModel.hand_id == hand_id).delete(
-            synchronize_session=False
-        )
-        db.query(BoardCardModel).filter(BoardCardModel.hand_id == hand_id).delete(
-            synchronize_session=False
-        )
-        db.query(HandModel).filter(HandModel.hand_id == hand_id).delete(
-            synchronize_session=False
-        )
-        db.commit()
+        idx += 1
 
+        outgoing = list(getattr(graph, "outgoing", lambda _n: [])(current))
+        if not outgoing:
+            break
+        nxt = outgoing[0]
+        if isinstance(nxt, tuple):
+            nxt = nxt[-1]
+        current = nxt
 
-def to_engine_action(req):
-
-    return Action(type=ActionType[req.type.upper()], amount=req.amount)
-
-
-def decode_hand_mask(mask, node_mask, player_mask):
-    cards = mask_to_card_ids(mask)
-    board_cards = mask_to_card_ids(mask & node_mask)
-    hole_cards = mask_to_card_ids(mask & player_mask)
-
-    return cards, hole_cards, board_cards
+    return {
+        "game_name": getattr(game_def, "game_name", None),
+        "layout_name": getattr(game_def, "layout_name", None),
+        "hole_cards": hole_cards_total or None,
+        "board_layout": {
+            "nodes": getattr(game_def, "node_count", None),
+            "streets": streets,
+            "street_names": street_names,
+        },
+        "creation_phases": creation_phases,
+    }
 
 
 game_service = GameService()

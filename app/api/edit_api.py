@@ -5,6 +5,13 @@ POST /game/edit/begin   — enter editing mode, clear current hand DB records
 POST /game/edit/apply   — apply edited snapshot, resume live game
 POST /game/edit/load    — load arbitrary snapshot (Replayer → Game Simulator)
 POST /game/edit/cancel  — cancel editing, restore pre-edit snapshot
+
+NOTE: Hand Editor is temporarily unsupported — game_service.py's
+begin_edit/apply_edit/load_edit/cancel_edit all raise
+NotImplementedError now that PokerState (and its snapshot/restore
+machinery) is gone and GraphEngine has no equivalent yet. Every route
+here catches that and returns 501 rather than letting it surface as an
+opaque 500 — remove these except clauses once Hand Editor is ported.
 """
 
 from __future__ import annotations
@@ -14,7 +21,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
-from app.services.game_service import game_service
+from app.services.game_service import GameService
 
 router = APIRouter(prefix="/game/edit")
 
@@ -57,6 +64,8 @@ def begin_edit(db: Session = Depends(get_db)):
     """
     try:
         game_service.begin_edit(db)
+    except NotImplementedError as exc:
+        raise HTTPException(status_code=501, detail=str(exc))
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"status": "editing"}
@@ -70,6 +79,8 @@ def apply_edit(req: EditStateRequest, db: Session = Depends(get_db)):
     """
     try:
         dto = game_service.apply_edit(req)
+    except NotImplementedError as exc:
+        raise HTTPException(status_code=501, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     except RuntimeError as exc:
@@ -86,6 +97,8 @@ def load_edit(req: EditStateRequest):
     """
     try:
         dto = game_service.load_edit(req)
+    except NotImplementedError as exc:
+        raise HTTPException(status_code=501, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     except RuntimeError as exc:
@@ -101,6 +114,8 @@ def cancel_edit():
     """
     try:
         dto = game_service.cancel_edit()
+    except NotImplementedError as exc:
+        raise HTTPException(status_code=501, detail=str(exc))
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return dto

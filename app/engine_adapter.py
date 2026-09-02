@@ -1,6 +1,8 @@
 from poker_engine.cards.card import Card
 
 from app.dto.state_dto import (
+    DecisionOptionDTO,
+    DecisionRequestDTO,
     GameStateDTO,
     PlayerBoardResultDTO,
     PlayerDTO,
@@ -9,6 +11,11 @@ from app.dto.state_dto import (
     ShowdownDTO,
 )
 
+# Actions whose legality implies a chip amount range — the frontend's
+# bet slider reads min_amount/max_amount off these options instead of
+# the old top-level min_raise/max_raise pair.
+_BET_LIKE_ACTIONS = {"bet", "raise"}
+
 
 def card_to_str(card_id):
 
@@ -16,6 +23,41 @@ def card_to_str(card_id):
         return None
 
     return str(Card(card_id))
+
+
+def _mask_to_card_strs(mask: int) -> list:
+    """LSB-iterate a 52-bit card bitmask into card strings — same idiom
+    used elsewhere in this module's own hand-decoding loop and in
+    poker_engine's mask_to_card_ids."""
+    cards = []
+    m = mask or 0
+    while m:
+        lsb = m & -m
+        cid = lsb.bit_length() - 1
+        cards.append(card_to_str(cid))
+        m ^= lsb
+    return cards
+
+
+def _board_card_mask(node_cards, node_mask: int) -> int:
+    """
+    Convert a PointResult's node_mask — a bitmask of NODE POSITIONS
+    ("bitmask of node indices (union across node_sets)", per the
+    hand_points.node_set DB column's own doc comment), not card ids —
+    into the actual 52-bit CARD mask for that board, by looking up
+    which card is dealt at each set node position. Needed because
+    best_hand_mask is a card mask; intersecting it against a
+    node-POSITION mask directly would be comparing the wrong units.
+    """
+    if not node_cards or not node_mask:
+        return 0
+    mask = 0
+    for node_idx, card_id in enumerate(node_cards):
+        if card_id is None:
+            continue
+        if (node_mask >> node_idx) & 1:
+            mask |= 1 << card_id
+    return mask
 
 
 def state_to_dto(poker_state):
@@ -83,39 +125,55 @@ def state_to_dto(poker_state):
         )
 
     # --------------------------------------------------
-    # Betting state
+    # Decision request — populated only while a player action is
+    # pending (phase == BETTING). None otherwise: DEAL_BOARD is
+    # transient (auto-progressed before this is ever externally
+    # visible — see GameService._progress_engine), and SHOWDOWN /
+    # HAND_COMPLETE need no response from anyone.
     # --------------------------------------------------
-    # if g.current_player is not None:
+    decision = None
+    current_player = None
+
     if poker_state.phase.name == "BETTING":
         current = g.current_player
         player = g.players[current]
-        to_call = g.bet_to_call - player.current_bet
+        to_call = max(g.bet_to_call - player.current_bet, 0)
+        min_raise = g.min_raise
+
         betting_type = getattr(poker_state.game_def, "betting_type", "no_limit")
         if betting_type == "pot_limit":
             pot_raise_max = g.pot + 2 * to_call
             max_raise = min(player.stack, pot_raise_max)
         else:
             max_raise = player.stack
-        actions = [a.name.lower() for a in g.legal_actions()]
-    else:
-        current = None
-        to_call = 0
-        max_raise = 0
-        actions = []
 
-    # print("Actions (backend): ", actions)
+        action_names = [a.name.lower() for a in g.legal_actions()]
+        options = [
+            DecisionOptionDTO(
+                action_name=name,
+                min_amount=min_raise if name in _BET_LIKE_ACTIONS else None,
+                max_amount=max_raise if name in _BET_LIKE_ACTIONS else None,
+            )
+            for name in action_names
+        ]
 
-    # Temporary - need to change to reflect betting type
-    min_raise = g.min_raise
-    # min_raise = max(g.min_raise, g.last_raise_size)
-    # max_raise = player.stack
+        decision = DecisionRequestDTO(
+            domain="BETTING",
+            seat=current + 1,
+            options=options,
+            to_call=to_call,
+            min_raise=min_raise,
+            max_raise=max_raise,
+            # PokerState has no graph node to pull metadata from —
+            # street index/name are already top-level GameStateDTO
+            # fields (street / street_names), so this is left empty on
+            # the legacy path. The graph-engine adapter populates it
+            # from graph.node(current_node).metadata instead.
+            node_metadata={},
+        )
+        current_player = current + 1
 
-    current_player = (
-        g.current_player + 1 if poker_state.phase.name == "BETTING" else None
-    )
-
-    # print("Phase: ", poker_state.phase)
-    # print("Current player: ", current_player)
+    hand_complete = poker_state.phase.name == "HAND_COMPLETE"
 
     # --------------------------------------------------
     # Showdown
@@ -129,7 +187,13 @@ def state_to_dto(poker_state):
 
         active_players = [i for i, p in enumerate(g.players) if not p.has_folded]
 
-        showdown = build_showdown_dto(result, rules, active_players)
+        showdown = build_showdown_dto(
+            result,
+            rules,
+            active_players,
+            node_cards=g.node_cards,
+            player_hand_masks={i: p.hand_mask for i, p in enumerate(g.players)},
+        )
 
         winners = [p + 1 for p, amt in result.payouts.items() if amt > 0]
 
@@ -144,35 +208,64 @@ def state_to_dto(poker_state):
     return GameStateDTO(
         street=g.street_index,
         pot=g.pot,
-        # board = board,
         nodes=nodes,
         layout_name=game_def.layout_name,
         game_name=game_def.game_name,
         street_names=street_names,
         points=points,
         players=players,
+        decision=decision,
+        hand_complete=hand_complete,
         current_player=current_player,
-        phase=poker_state.phase.name,
-        # hand_strengths = hand_strengths,
         showdown=showdown,
         winners=winners,
-        available_actions=actions,
-        to_call=max(0, to_call),
-        min_raise=min_raise,
-        max_raise=max_raise,
         discard_pile=discard_pile,
     )
 
 
-def build_showdown_dto(result, rules, active_players):
+def build_showdown_dto(result, rules, active_players, node_cards=None, player_hand_masks=None):
     """
     Build a rich showdown payload for the frontend.
 
     active_players: list of player indices in the order
                     the scoring engine evaluated them.
+    node_cards: g.node_cards (list[int|None], indexed by node position)
+                — used with a PointResult's node_mask to derive the
+                real card mask for that board (see _board_card_mask).
+    player_hand_masks: {player_index: hand_mask} — each active
+                player's own hole-card bitmask, for splitting
+                best_hand_mask into its hole vs board components.
+
+    NOTE — best_hand_cards/hole_cards_used/board_cards_used are now
+    derived entirely from PlayerPointResult.best_hand_mask (a
+    DB-confirmed real field — point_results.best_hand_mask is written
+    verbatim from pr.best_hand_mask by both session_logger.py and
+    tutorial_api.py) rather than read off possibly-nonexistent
+    best_hand_cards/hole_cards_used/board_cards_used attributes
+    directly. Those three previously came back via
+    getattr(r, "...", []) with a silent [] default, and EVERY result
+    — winners included — showed all three as [] regardless of
+    hand_category/hand_value being correct (confirmed via a live
+    showdown payload during testing), meaning at least one of those
+    attribute names doesn't actually exist on the real
+    PlayerPointResult and the getattr default was masking it rather
+    than raising. Deriving from best_hand_mask sidesteps needing to
+    know which of the pre-split attributes are real:
+      - best_hand_cards      = decode(best_hand_mask)
+      - hole_cards_used      = decode(best_hand_mask & player's own hand_mask)
+      - board_cards_used     = decode(best_hand_mask & this board's card mask)
+
+    node_cards/player_hand_masks default to None for backward
+    compatibility with any other caller that doesn't have them handy
+    — best_hand_cards still decodes fine in that case, but
+    hole_cards_used/board_cards_used fall back to empty (same
+    degraded behavior as before) since there's nothing to split
+    against.
     """
     if result is None:
         return None
+
+    player_hand_masks = player_hand_masks or {}
 
     # point_results = []
 
@@ -205,6 +298,9 @@ def build_showdown_dto(result, rules, active_players):
         for board_idx, board_obj in enumerate(data["boards"]):
 
             results = board_obj.results
+            board_mask = _board_card_mask(
+                node_cards, getattr(board_obj, "node_mask", 0)
+            )
 
             players = []
             winners = []
@@ -217,20 +313,21 @@ def build_showdown_dto(result, rules, active_players):
                 if is_winner:
                     winners.append(p_index)
 
+                best_hand_mask = getattr(r, "best_hand_mask", 0) or 0
+                hole_mask = player_hand_masks.get(p_index, 0)
+
                 players.append(
                     PlayerBoardResultDTO(
                         player_index=p_index,
                         hand_category=getattr(r, "category", None),
                         hand_value=getattr(r, "value", 0),
-                        best_hand_cards=[
-                            card_to_str(c) for c in getattr(r, "best_hand_cards", [])
-                        ],
-                        hole_cards_used=[
-                            card_to_str(c) for c in getattr(r, "hole_cards_used", [])
-                        ],
-                        board_cards_used=[
-                            card_to_str(c) for c in getattr(r, "board_cards_used", [])
-                        ],
+                        best_hand_cards=_mask_to_card_strs(best_hand_mask),
+                        hole_cards_used=_mask_to_card_strs(
+                            best_hand_mask & hole_mask
+                        ),
+                        board_cards_used=_mask_to_card_strs(
+                            best_hand_mask & board_mask
+                        ),
                         is_winner=is_winner,
                     )
                 )

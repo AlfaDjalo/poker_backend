@@ -1,12 +1,3 @@
-# import sys
-# from pathlib import Path
-
-# project_root = Path(__file__).resolve().parents[3]
-# engine_root = project_root / "poker_engine"
-
-# if str(engine_root) not in sys.path:
-#     sys.path.insert(0, str(engine_root))
-
 from poker_engine.cards.mask import mask_to_card_ids
 from sqlalchemy.orm import session
 
@@ -20,6 +11,7 @@ from app.db.models.point_cards import PointCard
 from app.db.models.point_results import PointResult
 from app.db.models.poker_sessions import PokerSession
 from app.db.models.table_seating import TableSeat
+from app.services.card_movement import deal_card, discard_card, pass_card
 
 
 def mask_to_cards(mask):
@@ -58,15 +50,17 @@ class SessionLogger:
         self.db.commit()
 
     def start_hand(self, config):
-
         print("Config: ", config)
 
         layout_name = config.get("layout_name") or "single_board"
         game_def = config.get("game_def")
 
+        variant_name = config.get("variant_name") or "nlhe"   # was: config.get("variant_name", "nlhe")
+
         hand = Hand(
             session_id=self.session_id,
-            variant_name=config.get("variant_name", "nlhe"),
+            variant_name=variant_name,
+            # variant_name=config.get("variant_name", "nlhe"),
             layout_name=layout_name,
             split_pot=config.get("split_pot", False),
             betting_config_id=config.get("betting_config_id", 1),
@@ -80,7 +74,40 @@ class SessionLogger:
 
         self.hand_id = hand.hand_id
         self._logged_nodes = set()
-        self._node_to_street_map = self._build_node_street_map(game_def)
+        # BoardCard.street used to be a real 1-based street index,
+        # derived either from game_def.street_nodes (legacy PokerState
+        # path) or from a graph-walk reconstruction
+        # (graph_engine_callbacks._node_street_map_from_graph, which
+        # made unconfirmed assumptions about graph.node(...).metadata
+        # key names and silently fell back to {} on any mismatch).
+        # Under GraphEngine there IS no structural "street" — the
+        # engine only knows node positions and decision points, not
+        # street indices — so reconstructing one from graph metadata
+        # was fighting the architecture, not modeling it. When that
+        # reconstruction silently failed, log_board()'s old
+        # `self._node_to_street_map.get(node, 1)` fallback stamped
+        # EVERY board card (flop, turn, river alike) with street=1,
+        # which is exactly why the Hand Replayer revealed the whole
+        # board on the very first frame.
+        #
+        # Fixed by dropping street reconstruction entirely: `street`
+        # on BoardCard now just records REVEAL ORDER — a small
+        # monotonically increasing group number, incremented each time
+        # log_board() observes a NEW batch of cards. Cards dealt
+        # together (a simultaneous double-flop bomb pot, a single-node
+        # river drop, etc.) naturally share a group; cards dealt in a
+        # later engine pass naturally get a higher one. This is
+        # derived purely from the actual order cards appeared in
+        # node_cards, so it's correct for ANY flow graph — standard,
+        # bomb pot, hopscotch, funnel, whatever — with zero graph
+        # introspection and zero per-variant assumptions.
+        #
+        # `game_def`/`node_street_map` config keys are still accepted
+        # (and still passed by graph_engine_callbacks.py /
+        # engine_callbacks.py) but are no longer consumed here — kept
+        # only so neither caller needs a matching change to stop
+        # passing them.
+        self._board_reveal_index = 0
 
         players_list = config.get("players", [])
         for player_index, p in enumerate(players_list):
@@ -92,16 +119,20 @@ class SessionLogger:
 
             cards = mask_to_card_ids(p.hand_mask)
 
+            # Routed through card_movement.deal_card() rather than a
+            # bare HoleCard insert — this is what also writes the
+            # corresponding CardEvent(event_type="DEALT") row, so the
+            # ledger and the current-state table start in sync from
+            # the very first card of the hand. See hole_cards.py /
+            # card_events.py for why both tables need to agree.
             for card in cards:
-
-                self.db.add(
-                    HoleCard(
-                        hand_id=self.hand_id,
-                        player_id=actual_player_id,
-                        street=0,
-                        card=card,
-                        visible=True,
-                    )
+                deal_card(
+                    self.db,
+                    hand_id=self.hand_id,
+                    player_id=actual_player_id,
+                    card=card,
+                    street=0,
+                    visible=True,
                 )
 
         self.db.commit()
@@ -130,24 +161,82 @@ class SessionLogger:
         self.db.add(a)
         self.db.commit()
 
+    def log_card_select(self, street, player_index, card_ids):
+        """
+        Log a CARD_SELECT decision (drawmaha-style discard) — every
+        card id the player chose is discarded via
+        card_movement.discard_card(), which flips its HoleCard row to
+        DISCARDED and writes the matching CardEvent row. Called from
+        graph_engine_callbacks.py's on_decision(); see that module's
+        _log_card_decision() for the CARD_SELECT-vs-CARD_PASS
+        dispatch and the pass_direction fallback that routes an
+        unresolvable CARD_PASS target here too.
+        """
+        actual_player_id = self.active_player_ids[player_index]
+        for cid in card_ids:
+            discard_card(
+                self.db,
+                hand_id=self.hand_id,
+                player_id=actual_player_id,
+                card=cid,
+                street=street,
+            )
+        self.db.commit()
+
+    def log_card_pass(self, street, player_index, target_player_index, card_ids):
+        """
+        Log a CARD_PASS decision (pass-the-trash-style) — every card
+        id the player chose moves directly from their hand to
+        target_player_index's hand via card_movement.pass_card() (one
+        CardEvent row per card, from_player_id/to_player_id both set).
+        """
+        from_player_id = self.active_player_ids[player_index]
+        to_player_id = self.active_player_ids[target_player_index]
+        for cid in card_ids:
+            pass_card(
+                self.db,
+                hand_id=self.hand_id,
+                from_player_id=from_player_id,
+                to_player_id=to_player_id,
+                card=cid,
+                street=street,
+                visible=True,
+            )
+        self.db.commit()
+
     def log_board(self, state):
         """
         Log any board cards that have been dealt but not yet recorded.
-        Safe to call multiple times — tracks which nodes have already been logged
-        and stamps each card with the street it was dealt on (from board layout config).
+        Safe to call multiple times — tracks which nodes have already
+        been logged and stamps every NEW batch of cards observed in a
+        single call with the same reveal-order group number (see
+        self._board_reveal_index's docstring in start_hand()). Cards
+        dealt across separate calls (i.e. separate deal points in the
+        flow graph) get strictly increasing group numbers, regardless
+        of how many nodes each deal point fills.
         """
         g = state.game
 
-        for node, card in enumerate(g.node_cards):
-            if card is not None and (self.hand_id, node) not in self._logged_nodes:
-                card_street = self._node_to_street_map.get(node, 1)
+        new_cards = [
+            (node, card)
+            for node, card in enumerate(g.node_cards)
+            if card is not None and (self.hand_id, node) not in self._logged_nodes
+        ]
+        if not new_cards:
+            return
 
-                self.db.add(
-                    BoardCard(
-                        hand_id=self.hand_id, street=card_street, node=node, card=card
-                    )
+        self._board_reveal_index += 1
+
+        for node, card in new_cards:
+            self.db.add(
+                BoardCard(
+                    hand_id=self.hand_id,
+                    street=self._board_reveal_index,
+                    node=node,
+                    card=card,
                 )
-                self._logged_nodes.add((self.hand_id, node))
+            )
+            self._logged_nodes.add((self.hand_id, node))
 
         self.db.commit()
 
@@ -222,34 +311,6 @@ class SessionLogger:
         )
 
         self.db.commit()
-
-    def _build_node_street_map(self, game_def):
-        """
-        Build a mapping of node index -> street (1-based) from the game definition.
-
-        game_def.street_nodes is List[List[int]] where street_nodes[i] contains
-        the node indices dealt on street i (0-based street index, i.e. index 0
-        = flop).  We store as 1-based street numbers so they align with the
-        board_cards.street column convention.
-
-        Example — double board bomb pot:
-            street_nodes = [[0,1,2,5,6,7], [3,8], [4,9]]
-            → nodes 0,1,2,5,6,7 get street=1  (flop)
-            → nodes 3,8         get street=2  (turn)
-            → nodes 4,9         get street=3  (river)
-        """
-        node_map = {}
-        if not game_def:
-            return node_map
-
-        try:
-            for street_idx, nodes in enumerate(game_def.street_nodes, start=1):
-                for node in nodes:
-                    node_map[node] = street_idx
-        except Exception as e:
-            print(f"Warning: Failed to build node_street_map: {e}")
-
-        return node_map
 
     def _next_action_index(self):
         if not hasattr(self, "_action_index"):

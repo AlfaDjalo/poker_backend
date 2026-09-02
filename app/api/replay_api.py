@@ -283,9 +283,14 @@ def get_hand(hand_id: int, db: Session = Depends(get_db)):
     ]
 
     # ── Hole cards ────────────────────────────
+    # Only cards still IN_HAND count toward a player's displayed hand —
+    # a card that was DISCARDED or PASSED_OUT during the hand (see
+    # hole_cards.py's own docstring) is no longer part of what this
+    # view means by "this player's hole cards". Full card-by-card
+    # history (deal/discard/draw/pass) lives in CardEvent, not here.
     hc_raw = (
         db.query(HoleCard)
-        .filter(HoleCard.hand_id == hand_id)
+        .filter(HoleCard.hand_id == hand_id, HoleCard.status == "IN_HAND")
         .order_by(HoleCard.player_id)
         .all()
     )

@@ -114,6 +114,7 @@ def delete_hypothetical_hand(hand_id: int, db: Session = Depends(get_db)):
     """Delete a hypothetical hand. Refuses to delete real hands."""
     from app.db.models.actions import Action
     from app.db.models.board_cards import BoardCard
+    from app.db.models.card_events import CardEvent
     from app.db.models.hand_points import HandPoint
     from app.db.models.hole_cards import HoleCard
     from app.db.models.payouts import Payout
@@ -155,6 +156,13 @@ def delete_hypothetical_hand(hand_id: int, db: Session = Depends(get_db)):
         synchronize_session=False
     )
     db.query(Action).filter(Action.hand_id == hand_id).delete(synchronize_session=False)
+    # See tutorial_api.py's _delete_hand_children for why CardEvent
+    # (the ledger backing HoleCard) needs deleting alongside HoleCard
+    # itself — this endpoint duplicates that deletion block rather
+    # than calling into tutorial_api, so it duplicates this fix too.
+    db.query(CardEvent).filter(CardEvent.hand_id == hand_id).delete(
+        synchronize_session=False
+    )
     db.query(HoleCard).filter(HoleCard.hand_id == hand_id).delete(
         synchronize_session=False
     )

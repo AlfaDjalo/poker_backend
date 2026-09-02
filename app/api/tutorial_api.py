@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_db
 from app.db.models.actions import Action
 from app.db.models.board_cards import BoardCard
+from app.db.models.card_events import CardEvent
 from app.db.models.hand_points import HandPoint
 from app.db.models.hands import Hand
 from app.db.models.hole_cards import HoleCard
@@ -33,6 +34,7 @@ from app.db.models.payouts import Payout
 from app.db.models.players import Player
 from app.db.models.point_cards import PointCard
 from app.db.models.point_results import PointResult
+from app.services.card_movement import deal_card
 from app.services.game_service import game_service
 
 router = APIRouter(prefix="/tutorial")
@@ -362,6 +364,12 @@ def _write_hand_payload(db: Session, hand: Hand, req: SaveHypotheticalHandReques
     db.flush()
 
     # ── Hole cards ───────────────────────────────────────────────
+    # Routed through card_movement.deal_card() rather than a bare
+    # HoleCard insert — writes the matching CardEvent(event_type=
+    # "DEALT") row too, so a hypothetical hand's ledger and its
+    # current-state table start in sync exactly like a live hand's
+    # does via SessionLogger.start_hand(). status defaults to
+    # "IN_HAND" inside deal_card(), matching hole_cards.py's model.
     if req.hole_cards:
         hole_card_sets = [(hc.player_seat, hc.cards) for hc in req.hole_cards]
     else:
@@ -372,14 +380,13 @@ def _write_hand_payload(db: Session, hand: Hand, req: SaveHypotheticalHandReques
         for card_str_val in cards:
             cid = parse_card(card_str_val)
             if cid is not None:
-                db.add(
-                    HoleCard(
-                        hand_id=hand.hand_id,
-                        player_id=pid,
-                        street=0,
-                        card=cid,
-                        visible=True,
-                    )
+                deal_card(
+                    db,
+                    hand_id=hand.hand_id,
+                    player_id=pid,
+                    card=cid,
+                    street=0,
+                    visible=True,
                 )
 
     # ── Board cards ──────────────────────────────────────────────
@@ -475,6 +482,18 @@ def _delete_hand_children(db: Session, hand_id: int):
         synchronize_session=False
     )
     db.query(Action).filter(Action.hand_id == hand_id).delete(synchronize_session=False)
+    # CardEvent is the ledger backing HoleCard (see card_movement.py /
+    # hole_cards.py) — deleting HoleCard rows without also deleting
+    # their CardEvent rows leaves orphaned ledger entries referencing a
+    # hand_id that no longer has any current-state rows to match, which
+    # would corrupt _next_sequence()'s max-per-hand lookup on any
+    # future re-save of a hand_id that got reused (hand_id is an
+    # autoincrement PK today, so reuse can't happen — but the orphan
+    # rows are dead weight either way and belong to a hand being wiped
+    # out entirely here).
+    db.query(CardEvent).filter(CardEvent.hand_id == hand_id).delete(
+        synchronize_session=False
+    )
     db.query(HoleCard).filter(HoleCard.hand_id == hand_id).delete(
         synchronize_session=False
     )
@@ -689,9 +708,16 @@ def get_hypothetical_hand_edit_state(hand_id: int, db: Session = Depends(get_db)
     }
 
     # ── Hole cards ─────────────────────────────────────────────────
+    # Only IN_HAND cards count toward the hand being re-opened for
+    # editing — a card that was DISCARDED/PASSED_OUT during play is no
+    # longer part of "what this player currently holds" (see
+    # hole_cards.py's docstring). Editing a hand with prior
+    # discards/passes back into the Creator's simplified phase model
+    # is a separate feature; this at minimum stops a stale discarded
+    # card from silently reappearing in the editor.
     hc_raw = (
         db.query(HoleCard)
-        .filter(HoleCard.hand_id == hand_id)
+        .filter(HoleCard.hand_id == hand_id, HoleCard.status == "IN_HAND")
         .order_by(HoleCard.player_id, HoleCard.card)
         .all()
     )
