@@ -1,7 +1,8 @@
+import traceback
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-import traceback
 
 from app.api.deps import get_db
 from app.services.game_service import game_service
@@ -160,6 +161,17 @@ def apply_action(req: ActionRequest):
         print("Action: ", action)
         return action #game_service.apply_action(req)
     except ValueError as e:
+        # TEMP DIAGNOSTIC: print the full traceback (not just str(e))
+        # for a ValueError too. Some of these (e.g. Grinch's "1 is not
+        # in list" after choosing "No") don't match ANY .index() call
+        # in this backend's own code (game_service.py /
+        # graph_engine_adapter.py — grepped, nothing raw there), which
+        # means it's almost certainly raised inside the Engine's own
+        # decision resolver. Without the real stack we're guessing —
+        # this makes the actual raise site visible in the server
+        # console. Remove once root-caused.
+        print(f"[game_api] /game/action 400: {e}")
+        traceback.print_exc()
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         traceback.print_exc()

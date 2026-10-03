@@ -15,6 +15,7 @@ from app.api.deps import get_db
 from app.db.models.actions import Action
 from app.db.models.annotations import Annotation
 from app.db.models.board_cards import BoardCard
+from app.db.models.card_events import CardEvent
 from app.db.models.hand_points import HandPoint
 
 # DB models
@@ -26,7 +27,30 @@ from app.db.models.point_cards import PointCard
 from app.db.models.point_results import PointResult
 from app.db.models.table_seating import TableSeat
 
+# Reused so the Hand Replayer's showdown payload is STRUCTURALLY
+# IDENTICAL to what the live Game Simulator gets on GameStateDTO.showdown
+# (see engine_adapter.build_showdown_dto / graph_engine_adapter.py) —
+# aliased to avoid colliding with this file's own legacy flat
+# PointResultDTO (kept below for backward compatibility).
+from app.dto.state_dto import (
+    PlayerBoardResultDTO,
+    PointResultDTO as NestedPointResultDTO,
+    ShowdownDTO as NestedShowdownDTO,
+)
+
 router = APIRouter(prefix="/replay")
+
+# NOTE: hands_api.py's delete_hypothetical_hand() has its own copy of this
+# same child-deletion logic, scoped to is_hypothetical == True hands only
+# (the Tutorial browser only ever deletes hands it created). This route is
+# the Hand Replayer's delete — it must work for REAL hands too, and it also
+# cleans up Annotation rows, which hands_api.py's version does not (Hand
+# Editor annotations are keyed on hand_id and were never deleted by
+# anything before this endpoint existed — a real hand's annotations would
+# silently orphan on delete). Not consolidated into one shared helper only
+# because the two call sites have different real-vs-hypothetical filters on
+# the Hand row itself; the child-row deletion statements are otherwise
+# identical.
 
 # ─────────────────────────────────────────────
 # Auth stub — replace with real auth later
@@ -48,6 +72,25 @@ def get_current_user_id() -> int:
 
 def card_str(card_id: int) -> str:
     return str(Card(card_id))
+
+
+def _mask_to_card_strs(mask: int | None) -> list[str]:
+    """
+    LSB-iterate a 52-bit card bitmask into card strings — same idiom
+    engine_adapter.py uses. PointResult.best_hand_mask is persisted
+    verbatim from the live scoring engine's own best_hand_mask (see
+    session_logger.finish_hand()), so this reconstructs
+    PlayerBoardResultDTO.best_hand_cards for a replayed hand exactly
+    the way the live path derives it.
+    """
+    cards = []
+    m = mask or 0
+    while m:
+        lsb = m & -m
+        cid = lsb.bit_length() - 1
+        cards.append(card_str(cid))
+        m ^= lsb
+    return cards
 
 
 # ─────────────────────────────────────────────
@@ -84,6 +127,27 @@ class HoleCardSetDTO(BaseModel):
     cards: list[str]
 
 
+class HoleCardEventDTO(BaseModel):
+    """
+    One row of the real CardEvent ledger (card_movement.py) — a deal,
+    draw, discard, or pass, in TRUE chronological order (sequence) and
+    stamped with the street it happened on. Unlike hole_cards below
+    (a flat, timing-free snapshot of each player's FINAL cards), this
+    is what the Replayer needs to correctly stage extra-card mechanics
+    (ESG/Catchup ESG dealing a bonus card mid-street, a Drawmaha
+    draw, a Pass-the-Trash transfer) on the actual street they
+    occurred, rather than showing them as present from the very first
+    (preflop) frame.
+    """
+
+    sequence: int
+    street: int
+    event_type: str  # "DEALT" | "DRAWN" | "DISCARDED" | "PASSED"
+    card: str
+    from_seat: int | None  # None for DEALT/DRAWN (card came from the deck)
+    to_seat: int | None  # None for DISCARDED (card went to the muck)
+
+
 class BoardCardDTO(BaseModel):
     street: int
     node: int
@@ -91,6 +155,15 @@ class BoardCardDTO(BaseModel):
 
 
 class PointResultDTO(BaseModel):
+    """
+    LEGACY flat shape — one row per (point, board, player), no
+    is_winner field. Kept for backward compatibility with any existing
+    consumer of this exact shape. New frontend code should read
+    `HandReplayDTO.showdown` instead (see that field's own docstring)
+    — it's the shape that actually carries winner information and
+    matches the live Game Simulator's GameStateDTO.showdown 1:1.
+    """
+
     point_name: str
     score_type: str
     player_seat: int
@@ -120,9 +193,30 @@ class HandReplayDTO(BaseModel):
     initial_stacks: dict
     actions: list[ActionDTO]
     hole_cards: list[HoleCardSetDTO]
+    hole_card_events: list[HoleCardEventDTO] = []
     board_cards: list[BoardCardDTO]
     point_results: list[PointResultDTO]
     payouts: list[PayoutDTO]
+
+    # NEW — structurally identical to GameStateDTO.showdown (see
+    # app/dto/state_dto.py's ShowdownDTO / PointResultDTO /
+    # PlayerBoardResultDTO, and engine_adapter.build_showdown_dto,
+    # which the live Game Simulator's response is built from). This is
+    # the fix for the Hand Replayer's showdown panel not being able to
+    # highlight the winning hand: the OLD flat `point_results` above
+    # has no `is_winner` field at all, so a frontend component written
+    # against the live shape (which DOES carry `is_winner` per player
+    # per board) had nothing to read when rendering a replayed hand.
+    # None only for a hand with no persisted showdown data at all
+    # (e.g. every player but one folded before showdown).
+    showdown: NestedShowdownDTO | None = None
+
+    # NEW — mirrors GameStateDTO's own top-level `winners` field
+    # (1-based seats that received a positive payout), computed the
+    # same way engine_adapter.state_to_dto /
+    # graph_engine_adapter.graph_state_to_dto already do it for a live
+    # hand: `[p + 1 for p, amt in result.payouts.items() if amt > 0]`.
+    winners: list[int] = []
 
 
 class AnnotationDTO(BaseModel):
@@ -197,6 +291,87 @@ def list_variants(db: Session = Depends(get_db)):
     """Return distinct variant names for the filter dropdown."""
     rows = db.query(Hand.variant_name).distinct().all()
     return [r[0] for r in rows]
+
+
+def _delete_replay_hand_children(db: Session, hand_id: int) -> None:
+    """
+    Delete every child row for `hand_id`, FK-safe order — used by the
+    Hand Replayer's DELETE below. Covers everything
+    tutorial_api._delete_hand_children does (PointCard -> PointResult ->
+    HandPoint, Payout, Action, CardEvent, HoleCard, BoardCard), PLUS
+    Annotation, which nothing deleted before this endpoint existed (see
+    the module-level NOTE above this router's DELETE route).
+
+    Works identically for a real hand or a hypothetical one — this route
+    has no is_hypothetical filter of its own (see the route's own
+    docstring for why deletion here isn't restricted the way
+    hands_api.delete_hypothetical_hand() is).
+    """
+    point_ids = [
+        r[0]
+        for r in db.query(HandPoint.point_id).filter(HandPoint.hand_id == hand_id).all()
+    ]
+    if point_ids:
+        pr_ids = [
+            r[0]
+            for r in db.query(PointResult.point_result_id)
+            .filter(PointResult.point_id.in_(point_ids))
+            .all()
+        ]
+        if pr_ids:
+            db.query(PointCard).filter(PointCard.point_result_id.in_(pr_ids)).delete(
+                synchronize_session=False
+            )
+        db.query(PointResult).filter(PointResult.point_id.in_(point_ids)).delete(
+            synchronize_session=False
+        )
+
+    db.query(Payout).filter(Payout.hand_id == hand_id).delete(synchronize_session=False)
+    db.query(HandPoint).filter(HandPoint.hand_id == hand_id).delete(
+        synchronize_session=False
+    )
+    db.query(Annotation).filter(Annotation.hand_id == hand_id).delete(
+        synchronize_session=False
+    )
+    db.query(Action).filter(Action.hand_id == hand_id).delete(synchronize_session=False)
+    # CardEvent is the ledger backing HoleCard (see card_movement.py /
+    # hole_cards.py) — must go before/alongside HoleCard, same rationale
+    # as tutorial_api._delete_hand_children's own note on this.
+    db.query(CardEvent).filter(CardEvent.hand_id == hand_id).delete(
+        synchronize_session=False
+    )
+    db.query(HoleCard).filter(HoleCard.hand_id == hand_id).delete(
+        synchronize_session=False
+    )
+    db.query(BoardCard).filter(BoardCard.hand_id == hand_id).delete(
+        synchronize_session=False
+    )
+
+
+@router.delete("/hands/{hand_id}", status_code=204)
+def delete_hand(hand_id: int, db: Session = Depends(get_db)):
+    """
+    Delete a hand and all of its child rows from the Hand Replayer.
+
+    Unlike hands_api.delete_hypothetical_hand() (Tutorial browser, which
+    only ever deletes hands IT created and refuses real ones), this route
+    has no is_hypothetical restriction — the Replayer lists and can delete
+    BOTH real and hypothetical hands, so its delete action needs to work
+    for both. If a caller specifically needs "only ever delete hypothetical
+    hands" semantics, hands_api.py's existing endpoint is still there for
+    that.
+
+    Does NOT delete the parent PokerSession/TableSeat rows for a real
+    hand's session — a session can span multiple hands, and deleting one
+    hand from history shouldn't tear down the session it belonged to.
+    """
+    hand = db.query(Hand).filter(Hand.hand_id == hand_id).first()
+    if not hand:
+        raise HTTPException(status_code=404, detail="Hand not found")
+
+    _delete_replay_hand_children(db, hand_id)
+    db.delete(hand)
+    db.commit()
 
 
 @router.get("/hands/{hand_id}", response_model=HandReplayDTO)
@@ -307,6 +482,37 @@ def get_hand(hand_id: int, db: Session = Depends(get_db)):
         for pid, cards in hc_by_player.items()
     ]
 
+    # ── Hole card event timeline ──────────────
+    # See HoleCardEventDTO's own docstring — this is the real,
+    # sequenced, street-stamped ledger the Replayer needs to stage
+    # extra-card / draw / pass mechanics correctly, instead of the
+    # timing-free hole_cards snapshot above. `street` on each row is
+    # now SessionLogger's own reveal-order counter (see
+    # session_logger.py / graph_engine_callbacks.py) — the SAME
+    # numbering board_cards[].street uses, guaranteed self-consistent
+    # by construction.
+    ce_raw = (
+        db.query(CardEvent)
+        .filter(CardEvent.hand_id == hand_id)
+        .order_by(CardEvent.sequence)
+        .all()
+    )
+    hole_card_events = [
+        HoleCardEventDTO(
+            sequence=ce.sequence,
+            street=ce.street,
+            event_type=ce.event_type,
+            card=card_str(ce.card),
+            from_seat=(
+                seat_of(ce.from_player_id) if ce.from_player_id is not None else None
+            ),
+            to_seat=(
+                seat_of(ce.to_player_id) if ce.to_player_id is not None else None
+            ),
+        )
+        for ce in ce_raw
+    ]
+
     # ── Board cards ───────────────────────────
     bc_raw = (
         db.query(BoardCard)
@@ -320,9 +526,48 @@ def get_hand(hand_id: int, db: Session = Depends(get_db)):
     ]
 
     # ── Point results ─────────────────────────
-    points_raw = db.query(HandPoint).filter(HandPoint.hand_id == hand_id).all()
-    point_results = []
+    # Two shapes are built from the SAME underlying rows: the legacy
+    # flat `point_results` list (kept for any existing consumer), and
+    # a nested `showdown` object using the EXACT SAME ShowdownDTO/
+    # PointResultDTO/PlayerBoardResultDTO shapes GameStateDTO.showdown
+    # already uses for the live Game Simulator (see
+    # app/dto/state_dto.py and engine_adapter.build_showdown_dto).
+    #
+    # This is the fix for "winning-hand highlighting works in the Game
+    # Simulator but not the Hand Replayer": the live shape carries an
+    # explicit `is_winner: bool` per player per board — the OLD flat
+    # replay shape had no such field at all, so a frontend showdown
+    # component written against the live shape had nothing to read for
+    # a replayed hand. Persisted PointResult.point_share > 0 is the
+    # same "did this player take part of this board's pot" signal the
+    # live path's own PlayerPointResult.is_winner is built from
+    # (mirrors this file's own payouts>0 convention used for
+    # `winners` below).
+    #
+    # session_logger.finish_hand() writes ONE HandPoint row per entry
+    # in the live result.points list — i.e. a multi-board point name
+    # (double board, etc.) produces MULTIPLE HandPoint rows sharing the
+    # same `name`, in the order they were scored (point_id is
+    # insertion order). Grouping HandPoint rows by `name` here
+    # reconstructs exactly the same "boards" list
+    # build_showdown_dto groups a live result.points list by .name
+    # into — so both paths produce identically-shaped output,
+    # board-for-board.
+    points_raw = (
+        db.query(HandPoint)
+        .filter(HandPoint.hand_id == hand_id)
+        .order_by(HandPoint.point_id)
+        .all()
+    )
+
+    point_results: list[PointResultDTO] = []  # legacy flat shape
+    boards_by_name: dict[str, list[HandPoint]] = {}
+    score_type_by_name: dict[str, str] = {}
+
     for hp in points_raw:
+        boards_by_name.setdefault(hp.name, []).append(hp)
+        score_type_by_name.setdefault(hp.name, hp.score_type)
+
         prs = db.query(PointResult).filter(PointResult.point_id == hp.point_id).all()
         for pr in prs:
             hole_used = [
@@ -357,6 +602,80 @@ def get_hand(hand_id: int, db: Session = Depends(get_db)):
                 )
             )
 
+    nested_point_results: list[NestedPointResultDTO] = []
+    for name, hp_rows in boards_by_name.items():
+        board_results: list[list[PlayerBoardResultDTO]] = []
+        board_winners: list[list[int]] = []
+        no_qualify: list[bool] = []
+
+        for hp in hp_rows:
+            prs = (
+                db.query(PointResult)
+                .filter(PointResult.point_id == hp.point_id)
+                .all()
+            )
+            players_dto: list[PlayerBoardResultDTO] = []
+            winners_this_board: list[int] = []
+
+            for pr in prs:
+                p_index = seat_of(pr.player_id) - 1  # engine's own 0-based convention
+                is_winner = (pr.point_share or 0.0) > 0
+                if is_winner:
+                    winners_this_board.append(p_index)
+
+                hole_used = [
+                    card_str(pc.card)
+                    for pc in db.query(PointCard)
+                    .filter(
+                        PointCard.point_result_id == pr.point_result_id,
+                        PointCard.source == "hole",
+                    )
+                    .all()
+                ]
+                board_used = [
+                    card_str(pc.card)
+                    for pc in db.query(PointCard)
+                    .filter(
+                        PointCard.point_result_id == pr.point_result_id,
+                        PointCard.source == "board",
+                    )
+                    .all()
+                ]
+
+                players_dto.append(
+                    PlayerBoardResultDTO(
+                        player_index=p_index,
+                        hand_category=pr.hand_category,
+                        hand_value=pr.hand_value or 0,
+                        best_hand_cards=_mask_to_card_strs(pr.best_hand_mask),
+                        hole_cards_used=hole_used,
+                        board_cards_used=board_used,
+                        is_winner=is_winner,
+                    )
+                )
+
+            board_results.append(players_dto)
+            board_winners.append(winners_this_board)
+            no_qualify.append(len(winners_this_board) == 0)
+
+        nested_point_results.append(
+            NestedPointResultDTO(
+                name=name,
+                score_type=score_type_by_name[name],
+                board_winners=board_winners,
+                board_results=board_results,
+                no_qualify=no_qualify,
+                # Scoop flags aren't persisted anywhere today (no
+                # scoop_from / "scooped from paired high" column on
+                # PointResult) — defaulted False rather than guessed,
+                # the same gap the live path would have if
+                # result.scoop_flags were ever absent (see
+                # build_showdown_dto's own `if result.scoop_flags:`
+                # guard).
+                scoop=[False] * len(hp_rows),
+            )
+        )
+
     # ── Payouts ───────────────────────────────
     payouts_raw = db.query(Payout).filter(Payout.hand_id == hand_id).all()
     payouts = [
@@ -367,6 +686,26 @@ def get_hand(hand_id: int, db: Session = Depends(get_db)):
         )
         for p in payouts_raw
     ]
+
+    # winners (1-based seats) mirrors GameStateDTO's own top-level
+    # `winners` field exactly — engine_adapter.state_to_dto /
+    # graph_engine_adapter.graph_state_to_dto both compute it as
+    # `[p + 1 for p, amt in result.payouts.items() if amt > 0]`.
+    winners = [p.player_seat for p in payouts if p.amount and p.amount > 0]
+
+    showdown = None
+    if nested_point_results:
+        showdown = NestedShowdownDTO(
+            payout_type=("split_pot" if hand.split_pot else "points"),
+            point_results=nested_point_results,
+            # Per-player running point tallies aren't persisted
+            # anywhere (no dedicated table) — left None, same as the
+            # live path leaves this None whenever it has nothing to
+            # report for a non-"points"-payout hand.
+            point_tallies=None,
+            payouts={p.player_seat - 1: p.amount for p in payouts},
+            pot_winners=[w - 1 for w in winners],
+        )
 
     return HandReplayDTO(
         hand_id=hand.hand_id,
@@ -380,9 +719,12 @@ def get_hand(hand_id: int, db: Session = Depends(get_db)):
         initial_stacks=initial_stacks,
         actions=actions,
         hole_cards=hole_cards,
+        hole_card_events=hole_card_events,
         board_cards=board_cards,
         point_results=point_results,
         payouts=payouts,
+        showdown=showdown,
+        winners=winners,
     )
 
 

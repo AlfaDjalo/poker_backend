@@ -3,7 +3,10 @@ equity_service.py
 Bridges CAP game state (variant, players, board) to the C++ equity engine.
 
 Responsibilities:
-  - Load a game variant via the existing loader
+  - Load a game variant via the GRAPH-NATIVE loader (poker_engine.rules.
+    loader.load_game, imported here as load_game_graph) — the same loader GameService uses for
+    the live game — so board node_count and hole-card count always agree
+    with what the Frontend actually sees via GET /game/variants/{name}/config.
   - Convert card strings ("Ah", "Kd") to integer ids via Card.from_str
   - Convert PointDefinitions and ScoreType enums to the plain ints cap_equity expects
   - Call cap_equity.calculate_equity()
@@ -12,26 +15,47 @@ Responsibilities:
 The service intentionally has NO FastAPI dependency — it can be called
 from tests, notebooks, or the API layer.
 
-── REDESIGN (rich equity reporting) ────────────────────────────────────
-cap_equity.calculate_equity now returns a much richer structure per
-player: overall pot equity (fraction + currency), scoop/split
-probability, and a full per-point breakdown (win/tie probability +
-currency contribution). To make that possible the C++ engine needs to
-run the SAME resolution rules real showdowns use, so this service now
-also passes through:
+── GRAPH MIGRATION FIX (hole-card count) ───────────────────────────────
+Previously loaded variants via poker_engine.games.loader.load_game() (the
+LEGACY loader) and read game_def.hole_cards / game_def.node_count off it.
+Per CAP_Technical_Quick_Reference.md §12.4, the graph-native
+GameDefinition (poker_engine.rules.loader.load_game, imported here as
+load_game_graph — what
+GameService/the live table actually runs on) has NO hole_cards attribute
+at all, and its board/node layout is the one the Frontend's board_nodes
+payload is actually built against.
 
-  - payout_type          (GameRules.payout_type: "points" | "split_pot")
-  - no_qualify_action     (GameRules.no_qualify_action: "scoop" | "eliminate")
-  - pot_size              (caller-supplied; 0 disables currency fields)
-  - per point: is_low, low_qualifier, scoop_from
-      (mirrors PointDefinition / GameRules so the C++ engine can apply
-      the same no-qualify handling as ShowdownResolver._handle_no_qualify)
+An interim fix derived hole-card count by walking compiled graph node
+.metadata for deals_hole/card_count keys, with a dry-run-deal fallback
+when that walk found nothing. BOTH the metadata keys and the need for a
+fallback were symptoms of a wrong assumption: metadata never carries
+deals_hole/card_count at all — no variant YAML or the flow compiler
+(poker_engine/graph/flow_loader.py) ever puts those keys there. The real
+signal is structural (node.kind == NodeKind.AUTO, node.auto_type ==
+"deal_hole_cards", node.config["count"]), confirmed by the Engine team.
+
+poker_engine.graph.graph_hole_cards now exposes this as the canonical,
+single source of truth:
+    hole_cards_per_player(graph) -> int         # raises ValueError if none
+    first_deal_hole_cards_count(graph) -> int|None   # soft-fail variant
+
+This module uses hole_cards_per_player() (hard-fail) since an equity
+calculation genuinely cannot proceed without a real hole-card count — a
+malformed/unrecognized graph should surface as a real 400, not silently
+fall back to a guessed value. The metadata walk and dry-run-deal
+fallback that used to live here are removed entirely; no exception
+handling is needed for that former fallback's own failure mode, since
+there's no fallback left to fail.
+
+GameRules (payout_type, no_qualify_action, showdown_type, points,
+is_low_type(), low_qualifier, qualifies()) is UNCHANGED by the graph
+migration — only GameDefinition lost fields — so every rules-based read
+below is untouched.
 
 evaluator_wrapper is unchanged from the previous fix: it re-runs
 rules.qualifies() on every raw score before it reaches the C++ engine,
 so a non-qualifying low reading can never "win" a low point's equity
-cell. low_qualifier / is_low are passed to C++ as well, purely as a
-safety net in case a future evaluator implementation doesn't pre-filter.
+cell.
 ─────────────────────────────────────────────────────────────────────────
 """
 
@@ -39,7 +63,8 @@ from typing import Any
 
 from poker_engine import cap_equity, poker_eval
 from poker_engine.cards.card import Card
-from poker_engine.games.loader import load_game
+from poker_engine.graph.graph_hole_cards import hole_cards_per_player
+from poker_engine.rules.loader import load_game as load_game_graph
 
 
 def _card_srt_to_id(card_str: str | None) -> int | None:
@@ -62,6 +87,21 @@ def _score_type_int(score_type) -> int:
 
 def _showdown_type_int(showdown_type) -> int:
     return int(showdown_type)
+
+
+def _hole_cards_per_player_from_metadata(graph) -> int:
+    """
+    No metadata is actually involved -- kept as a thin named wrapper
+    (rather than calling graph_hole_cards.hole_cards_per_player()
+    directly at the call site) only so this function's name still
+    documents, at the one place EquityService.calculate() reads it,
+    that a prior version of this file derived this value from node
+    metadata and that assumption was wrong. Consider renaming this
+    function (and updating its call site) to just import and call
+    graph_hole_cards.hole_cards_per_player directly — nothing here
+    does anything beyond that delegation anymore.
+    """
+    return hole_cards_per_player(graph)
 
 
 class _RawScore:
@@ -140,14 +180,34 @@ class EquityService:
           "iterations": int,
           "elapsed_ms": float,
         }
+
+        Raises
+        ------
+        ValueError
+            If the variant's compiled graph has no node_count, or no
+            deal_hole_cards AUTO node at all (hole_cards_per_player()
+            raising) — both indicate a malformed/unsupported variant
+            graph, not a recoverable condition, so this is allowed to
+            propagate to the caller (equity_api.py maps ValueError to
+            HTTP 400).
         """
 
-        # ── Load game definition ──────────────────────────────────
-        game_def, rules = load_game(variant_name)
+        # ── Load game definition — GRAPH-NATIVE, matches the live table ──
+        game_def, rules, graph = load_game_graph(variant_name)
+
+        node_count = getattr(game_def, "node_count", None)
+        if node_count is None:
+            raise ValueError(
+                f"Graph-native GameDefinition for {variant_name!r} has no "
+                f"node_count — cannot size the board_nodes array for equity."
+            )
+
+        # Raises ValueError if the graph has no deal_hole_cards AUTO node
+        # at all — allowed to propagate (see docstring above).
+        total_hole_cards = _hole_cards_per_player_from_metadata(graph)
 
         # ── Build node_count-length board_nodes list ──────────────
         # Start with all unknown (-1), fill in known cards.
-        node_count = game_def.node_count
         board_nodes: list[int] = [-1] * node_count
 
         for entry in board_nodes_input or []:
@@ -176,7 +236,7 @@ class EquityService:
                 {
                     "seat": seat,
                     "known_cards": known_ids,
-                    "total_hole_cards": game_def.hole_cards,
+                    "total_hole_cards": total_hole_cards,
                 }
             )
 
@@ -186,6 +246,8 @@ class EquityService:
         # PointDefinition so the C++ engine can replicate
         # ShowdownResolver._handle_no_qualify's scoop/eliminate behaviour
         # and correctly compute scoop/split probabilities at the pot level.
+        # GameRules/PointDefinition are untouched by the graph migration
+        # (only GameDefinition lost fields) — this section is unchanged.
         default_showdown = rules.showdown_type
         points_c: list[dict] = []
         for pt in rules.points:
@@ -246,7 +308,7 @@ class EquityService:
         # ── Call C++ engine ───────────────────────────────────────
         result = cap_equity.calculate_equity(
             variant_name=variant_name,
-            total_hole_cards=game_def.hole_cards,
+            total_hole_cards=total_hole_cards,
             players=players_c,
             board_nodes=board_nodes,
             points=points_c,

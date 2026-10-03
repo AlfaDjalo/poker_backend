@@ -5,7 +5,7 @@ migration: PokerState -> GraphEngine").
 
 Import paths (previous revision guessed several of these wrong —
 corrected here per the doc's "Load"/"Run a hand" code blocks):
-    from poker_engine.rules.graph_loader import load_game_graph
+    from poker_engine.rules.loader import load_game as load_game_graph
     from poker_engine.graph.graph_engine import GraphEngine
     from poker_engine.graph.hand_session import new_hand_state, start_new_hand
     from poker_engine.graph.callbacks import submit_decision
@@ -46,10 +46,14 @@ Hand Editor is NOT carried forward — see the previous revision's
 docstring for why (still true: no GraphEngine-native snapshot/restore
 mechanism exists per the doc's "Behavioral differences" section).
 
-get_variant_config()'s flow-walking (_summarize_flow) is unchanged
-from the previous revision and still speculative pending confirmation
-of graph.node(...)'s metadata key names — see that function's own
-ASSUMPTIONS block.
+get_variant_config()'s flow-walking (_summarize_flow) no longer trusts a
+graph node's own metadata as the authoritative street number — it now
+derives street/reveal-group numbering itself, the same way
+SessionLogger derives it for live hands (see _summarize_flow's own
+module-level note). The remaining graph.node(...) metadata KEY NAMES
+(deals_hole, deals_board_street-as-presence-signal, street_name,
+node_indices) are still pending confirmation against real graph-loader
+source — see that function's own ASSUMPTIONS block.
 """
 
 from importlib import resources
@@ -59,12 +63,13 @@ from poker_engine.scoring.scoring_engine import CppScoringEngine
 from poker_engine.state.player_state import PlayerState
 from poker_engine.cards.deck import Deck as GraphDeck
 
-from poker_engine.rules.graph_loader import load_game_graph
+from poker_engine.rules.loader import load_game as load_game_graph
 from poker_engine.graph.graph_engine import GraphEngine
 from poker_engine.graph.hand_session import new_hand_state, start_new_hand
 from poker_engine.graph.callbacks import submit_decision
 from poker_engine.graph.core_types import DecisionResponse
 from poker_engine.showdown.showdown_resolver import ShowdownResolver
+from poker_engine.graph.graph_hole_cards import first_deal_hole_cards_count
 
 from app.db.models.players import Player
 from app.db.models.poker_tables import PokerTable
@@ -80,6 +85,34 @@ from app.services.graph_engine_callbacks import BackendGraphEngineCallbacks
 from app.services.session_logger import SessionLogger
 
 DEFAULT_GAME = "holdem"
+
+
+def _apply_sitting_out(players) -> None:
+    """
+    Mark any zero-stack player as sitting out for the next hand, per
+    the Engine team's wiring guidance: set PlayerState.sitting_out
+    before constructing/reusing the player list, then call
+    start_new_hand() as normal — no index shifting, no other engine
+    call site needs to change (the Engine itself skips a sitting_out
+    player for dealing/action/pass-routing).
+
+    Works identically whether `players` is a freshly-constructed
+    PlayerState list (see new_hand()'s variant-switch branch) or the
+    Engine's OWN already-live player objects being reused in place
+    (new_hand()'s same-variant branch, where no new PlayerState list
+    is ever built at all — see that branch's own comment for why
+    mutating the existing objects directly is required there).
+
+    Only a stack<=0 check for now — there's no manual "sit this player
+    out" control anywhere in this API yet; if/when one exists, it
+    should set p.sitting_out = True itself and this function should
+    stop clobbering an already-True value for a player who still has
+    chips but chose to sit out (currently harmless since every caller
+    of this function is about to (re)deal a brand new hand, so there's
+    no prior manual sit-out state to preserve yet).
+    """
+    for p in players:
+        p.sitting_out = getattr(p, "stack", 0) <= 0
 
 
 class GameService:
@@ -104,6 +137,20 @@ class GameService:
         # methods below just raise NotImplementedError.
         self.editing_mode = False
         self.pre_edit_snapshot = None
+
+        # Reentrancy guard — apply_action() mutates self.engine in place
+        # with no locking (submit_decision runs synchronously against
+        # the shared engine object). A second request landing while the
+        # first is still being processed — a double-click, a retried
+        # request after a slow response, or (per the ESG crash report)
+        # the frontend firing twice off the extra-card AUTO node's rapid
+        # state update — would otherwise find engine.pending_request
+        # already None/changed and surface as the confusing "No
+        # decision is currently pending." ValueError instead of a
+        # clear "still processing, try again" signal. Mirrors
+        # TrainerService._busy exactly — see that class's own docstring
+        # for the same rationale.
+        self._busy = False
 
     # --------------------------------------------------
     # Variant discovery
@@ -172,6 +219,7 @@ class GameService:
             raise Exception(f"Found only {len(db_players)} players.")
 
         players = [PlayerState(stack=100) for _ in db_players]
+        _apply_sitting_out(players)
 
         game_def, rules, graph = load_game_graph(self.current_game)
 
@@ -236,12 +284,49 @@ class GameService:
         if self.engine is None:
             return None
 
+        if self._busy:
+            raise ValueError(
+                "A previous action is still being processed for this hand — "
+                "please retry in a moment."
+            )
+        self._busy = True
+        try:
+            return self._apply_action_locked(req)
+        finally:
+            self._busy = False
+
+    def _apply_action_locked(self, req):
+        print("Req: ", req)
+
+        # Diagnostic: confirm exactly what the engine thinks is pending
+        # BEFORE we try to build a response against it — if this ever
+        # prints "pending=None" right before the ValueError below, that
+        # proves the engine had already resolved/advanced past the
+        # decision by the time this request was processed (a stale/
+        # duplicate submission), rather than something wrong in how the
+        # response itself is built.
+        pending = self.engine.pending_request
+        is_complete = getattr(self.engine, "is_complete", None)
+        current_node = getattr(getattr(self.engine, "state", None), "current_node", None)
+        print(
+            f"[apply_action] pending_request={pending!r} "
+            f"domain={getattr(pending, 'domain', None)!r} "
+            f"player_index={getattr(pending, 'player_index', None)!r} "
+            f"is_complete={is_complete!r} current_node={current_node!r} "
+            f"last_showdown={getattr(self.engine, 'last_showdown', None)!r} "
+            f"last_winners={getattr(self.engine, 'last_winners', None)!r}"
+        )
+
         response, player_index = _build_decision_response(self.engine, req)
+        print(f"Response: {req} player_index: {player_index} graph_callbacks: {self.graph_callbacks}")
 
         if self.graph_callbacks is not None and player_index is not None:
             self.graph_callbacks.note_pre_decision(self.engine, player_index)
 
-        submit_decision(self.engine, response, callbacks=self.graph_callbacks)
+        try:
+            submit_decision(self.engine, response, callbacks=self.graph_callbacks)
+        except ValueError:
+            raise
 
         return graph_state_to_dto(self.engine, self.game_def, self.rules, graph=self.graph)
 
@@ -270,6 +355,7 @@ class GameService:
 
         if self.game_def is None or self.game_def.game_name != game_def.game_name:
             players = [PlayerState(stack=p.stack) for p in _game_obj(self.engine).players]
+            _apply_sitting_out(players)
             hand_state = new_hand_state(
                 players, game_def, dealer_position=self._dealer_position
             )
@@ -284,6 +370,14 @@ class GameService:
             #     graph, hand_state, deck, showdown_resolver=showdown_resolver
             # )
             # self.graph = graph
+        else:
+            # Same variant, continuing session: no new PlayerState list
+            # is ever constructed on this path — start_new_hand() deals
+            # directly into the Engine's existing live player objects.
+            # sitting_out has to be set on those SAME objects, in
+            # place, or a player who busted on the previous hand would
+            # never be marked out for this one.
+            _apply_sitting_out(_game_obj(self.engine).players)
 
         self.game_def = game_def
         self.rules = rules
@@ -299,29 +393,29 @@ class GameService:
     # Hand Editor — not carried forward, see module docstring.
     # --------------------------------------------------
 
-    def begin_edit(self, db):
-        raise NotImplementedError(
-            "Hand editing has no GraphEngine-native snapshot/restore "
-            "mechanism yet — see game_service.py's module docstring."
-        )
+    # def begin_edit(self, db):
+    #     raise NotImplementedError(
+    #         "Hand editing has no GraphEngine-native snapshot/restore "
+    #         "mechanism yet — see game_service.py's module docstring."
+    #     )
 
-    def apply_edit(self, req):
-        raise NotImplementedError(
-            "Hand editing has no GraphEngine-native snapshot/restore "
-            "mechanism yet — see game_service.py's module docstring."
-        )
+    # def apply_edit(self, req):
+    #     raise NotImplementedError(
+    #         "Hand editing has no GraphEngine-native snapshot/restore "
+    #         "mechanism yet — see game_service.py's module docstring."
+    #     )
 
-    def load_edit(self, req):
-        raise NotImplementedError(
-            "Hand editing has no GraphEngine-native snapshot/restore "
-            "mechanism yet — see game_service.py's module docstring."
-        )
+    # def load_edit(self, req):
+    #     raise NotImplementedError(
+    #         "Hand editing has no GraphEngine-native snapshot/restore "
+    #         "mechanism yet — see game_service.py's module docstring."
+    #     )
 
-    def cancel_edit(self):
-        raise NotImplementedError(
-            "Hand editing has no GraphEngine-native snapshot/restore "
-            "mechanism yet — see game_service.py's module docstring."
-        )
+    # def cancel_edit(self):
+    #     raise NotImplementedError(
+    #         "Hand editing has no GraphEngine-native snapshot/restore "
+    #         "mechanism yet — see game_service.py's module docstring."
+    #     )
 
 
 # --------------------------------------------------------------------
@@ -537,58 +631,149 @@ def _build_choice_decision_response(engine, pending, req_body):
 
 
 # --------------------------------------------------------------------
-# Flow summarization for get_variant_config() — unchanged from the
-# previous revision; still speculative. See its own ASSUMPTIONS block.
+# Flow summarization for get_variant_config() — GRAPH-NATIVE.
+#
+# Previously this trusted a node's own metadata["deals_board_street"]
+# VALUE as the authoritative "which street is this" number (a direct
+# port of the old fixed flop/turn/river creation_phases YAML shape),
+# and callers (tutorial_api.py's Hand Creator) built their own street
+# stamps around that same assumption. Two problems with that, both the
+# same class of bug session_logger.py already had to fix once for live
+# hands (see that module's own "ONE STREET COUNTER" docstring):
+#
+#   1. It assumes the compiled graph node's metadata dict preserves
+#      some flow-YAML-authored street index verbatim — never actually
+#      confirmed, and exactly the kind of assumption that turned out
+#      wrong for live hands (graph_engine_callbacks.py's now-removed
+#      node-street-map helpers had the identical bug).
+#   2. Even if present and correct, it's a variant-authored number
+#      with flop/turn/river-shaped assumptions baked in — meaningless
+#      for a bomb pot, a multi-board/hopscotch layout, or any custom
+#      flow with a different number/shape of board reveals.
+#
+# Fixed the same way live hands were fixed: `deals_board_street` is
+# now read only as a PRESENCE signal ("does this node deal board
+# cards at all?"), never as a trusted index. The actual street number
+# every phase gets — `reveal_group` — is OUR OWN running counter,
+# incremented once per board-dealing phase encountered during the
+# walk, in walk order. This is identical in spirit to
+# SessionLogger._board_reveal_index / current_street(): "which street
+# is this" is defined as "how many board reveals have happened so far
+# in this walk", nothing else. tutorial_api.py's Hand Creator now
+# stamps BoardCard.street / Action.street with this same reveal_group
+# value, so a hypothetical hand's street numbering is derived exactly
+# the same way a live hand's is, and both replay identically for any
+# board layout — standard, bomb pot, multi-board, or custom.
+#
+# `decision_domain` (the DECISION node's real domain name — BETTING,
+# CARD_SELECT, CARD_PASS, BOOLEAN, CHOICE, or None for an AUTO node)
+# replaces the old BETTING-only `allows_betting` bool as the primary
+# field; `allows_betting` is kept, derived from it, purely for
+# backward compatibility with any caller still reading the old name
+# (the Hand Creator wizard itself is still BETTING-only today — see
+# the CAP_Technical_Quick_Reference's "Frontend needs generic decision
+# UI" gap — but callers can now at least see a non-BETTING decision
+# is pending instead of it silently reading as allows_betting=False
+# with no explanation).
 # --------------------------------------------------------------------
+
+
+from poker_engine.graph.graph_hole_cards import first_deal_hole_cards_count
+
+
+def _node_deals_hole_cards(node) -> tuple[bool, int]:
+    """
+    Structural (not metadata-based) check for whether a compiled graph
+    node deals hole cards, and how many. Per the Engine team's
+    confirmation: metadata never carries deals_hole/card_count — the
+    real signal is node.kind == NodeKind.AUTO, node.auto_type ==
+    "deal_hole_cards", and node.config["count"]. Isolated here as the
+    one place this structural check lives, since the per-node walk
+    below (for creation_phases) needs a per-node answer, distinct from
+    graph_hole_cards.first_deal_hole_cards_count()'s single
+    first-match-wins answer used for the summary's aggregate field.
+    """
+    kind = getattr(node, "kind", None)
+    kind_name = getattr(kind, "name", str(kind)) if kind is not None else None
+    if kind_name != "AUTO":
+        return False, 0
+    if getattr(node, "auto_type", None) != "deal_hole_cards":
+        return False, 0
+    config = getattr(node, "config", {}) or {}
+    return True, int(config.get("count", 1))
 
 
 def _summarize_flow(game_def, rules, graph):
     """
-    ASSUMPTIONS (unconfirmed against real graph-module source):
+    ASSUMPTIONS (unconfirmed against real graph-module source — same
+    remaining ones as before; the deals_hole/card_count assumption is
+    now CONFIRMED and fixed, see _node_deals_hole_cards above and the
+    Engine team's note):
       - graph has a `.start_node` attribute (or `.root`/`.entry` —
         tried in that order) giving the first node id.
       - graph.node(node_id) returns an object with `.domain` (for
         DECISION nodes, e.g. "BETTING") and `.metadata` (dict) — per
-        the migration doc's confirmed mapping.
+        the migration doc's confirmed mapping. `.metadata` is STILL
+        used for `deals_board_street` (presence-only) and
+        `street_name`/`node_indices` — only the hole-card signal
+        moved off metadata entirely.
       - graph.outgoing(node_id) returns an iterable of next node ids
         (or (condition, next_id) pairs for the transitions: override
-        path) — this walk only follows the FIRST outgoing edge, since
-        it just needs one representative pass through the flow for
-        wizard display, not full branch enumeration.
-      - A node's metadata dict may contain `deals_hole` (bool),
-        `deals_board_street` (int | None), `street_name` (str | None)
-        — mirroring the old creation_phases YAML block's own field
-        names. If the real metadata uses different keys, only the
-        `.get(...)` calls below need updating.
-      - hole_cards total is derived by summing metadata.get(
-        "card_count", 1) across every node with deals_hole truthy.
+        path) — this walk only follows the FIRST outgoing edge.
 
     Cycle-safe: stops walking a branch the moment it revisits a node
     id (betting's own loop branch would otherwise spin forever).
+
+    SETUP phase
+    ------------
+    creation_phases[0] is ALWAYS a synthetic player-setup step
+    (id="SETUP", no cards, no betting, decision_domain=None) —
+    required by the Hand Creator wizard so users can add players to
+    empty seats before any hole-card or board-dealing phase exists.
     """
+    SETUP_PHASE = {
+        "id": "SETUP",
+        "label": "Setup",
+        "deals_hole": False,
+        "deals_board": False,
+        "reveal_group": 0,
+        "board_node_indices": [],
+        "decision_domain": None,
+        "allows_betting": False,
+    }
+
     start = (
         getattr(graph, "start_node", None)
         or getattr(graph, "root", None)
         or getattr(graph, "entry", None)
     )
 
+    # Aggregate hole-card count — canonical helper, soft-fails to None
+    # (omitted from the response) rather than raising, since this
+    # endpoint (GET /game/variants/{game_name}/config) is read by the
+    # Frontend wizard for display and shouldn't 500 a whole variant's
+    # config over a hole-card-count derivation gap.
+    hole_cards_total = first_deal_hole_cards_count(graph)
+
     if start is None:
-        return {
+        result = {
             "game_name": getattr(game_def, "game_name", None),
             "layout_name": getattr(game_def, "layout_name", None),
-            "hole_cards": None,
+            "hole_cards": hole_cards_total,
             "board_layout": {
                 "nodes": getattr(game_def, "node_count", None),
                 "streets": {},
                 "street_names": {},
             },
-            "creation_phases": [],
+            "creation_phases": [SETUP_PHASE],
         }
+        return result
 
-    creation_phases = []
-    hole_cards_total = 0
+    creation_phases = [SETUP_PHASE]
     streets: dict[int, list[int]] = {}
     street_names: dict[int, str] = {}
+
+    reveal_group = 0
 
     visited = set()
     current = start
@@ -601,26 +786,29 @@ def _summarize_flow(game_def, rules, graph):
         domain_name = getattr(domain, "name", str(domain)) if domain is not None else None
         metadata = dict(getattr(node, "metadata", {}) or {})
 
-        deals_hole = bool(metadata.get("deals_hole", False))
-        deals_board_street = metadata.get("deals_board_street")
+        deals_hole, _hole_card_count = _node_deals_hole_cards(node)
+        # Presence-only signal — the VALUE (if any) is never trusted
+        # as a street number.
+        deals_board = metadata.get("deals_board_street") is not None
         street_name = metadata.get("street_name")
-        allows_betting = domain_name == "BETTING"
+        node_indices = metadata.get("node_indices", []) if deals_board else []
+        decision_domain = domain_name
 
-        if deals_hole:
-            hole_cards_total += int(metadata.get("card_count", 1))
-
-        if deals_board_street is not None:
-            node_indices = metadata.get("node_indices", [])
-            streets.setdefault(int(deals_board_street), list(node_indices))
+        if deals_board:
+            reveal_group += 1
+            streets.setdefault(reveal_group, list(node_indices))
             if street_name:
-                street_names[int(deals_board_street)] = street_name
+                street_names[reveal_group] = street_name
 
         creation_phases.append(
             {
                 "id": metadata.get("id", f"NODE_{idx}"),
                 "deals_hole": deals_hole,
-                "deals_board_street": deals_board_street,
-                "allows_betting": allows_betting,
+                "deals_board": deals_board,
+                "reveal_group": reveal_group,
+                "board_node_indices": node_indices,
+                "decision_domain": decision_domain,
+                "allows_betting": decision_domain == "BETTING",  # back-compat
             }
         )
         idx += 1
@@ -636,7 +824,7 @@ def _summarize_flow(game_def, rules, graph):
     return {
         "game_name": getattr(game_def, "game_name", None),
         "layout_name": getattr(game_def, "layout_name", None),
-        "hole_cards": hole_cards_total or None,
+        "hole_cards": hole_cards_total,
         "board_layout": {
             "nodes": getattr(game_def, "node_count", None),
             "streets": streets,
@@ -644,6 +832,5 @@ def _summarize_flow(game_def, rules, graph):
         },
         "creation_phases": creation_phases,
     }
-
 
 game_service = GameService()

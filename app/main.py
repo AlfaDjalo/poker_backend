@@ -10,11 +10,12 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.edit_api import router as edit_router
+# from app.api.edit_api import router as edit_router
 from app.api.equity_api import router as equity_router
 from app.api.game_api import router as game_router
+from app.api.construction_api import router as construction_router
 from app.api.hands_api import router as hands_router
-from app.api.push_fold_api import router as push_fold_router
+# from app.api.push_fold_api import router as push_fold_router
 from app.api.replay_api import router as replay_router
 from app.api.trainer_api import router as trainer_router
 from app.api.tutorial_api import router as tutorial_router
@@ -41,8 +42,9 @@ app.add_middleware(
 app.include_router(game_router)
 app.include_router(replay_router)
 app.include_router(equity_router)
-app.include_router(edit_router)
+# app.include_router(edit_router)
+app.include_router(construction_router)
 app.include_router(tutorial_router)
 app.include_router(hands_router)
-app.include_router(push_fold_router)
+# app.include_router(push_fold_router)
 app.include_router(trainer_router)

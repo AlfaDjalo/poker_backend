@@ -229,10 +229,26 @@ class HoleCardSetInput(BaseModel):
 class BoardCardInput(BaseModel):
     node: int
     card: str
-    street: int  # 1-based: 1=flop, 2=turn, 3=river
+    # `reveal_group` from GET /game/variants/{game_name}/config's
+    # creation_phases (the phase that deals this node) — NOT a fixed
+    # "1=flop, 2=turn, 3=river" index. Same numbering convention a live
+    # hand's BoardCard.street uses (SessionLogger._board_reveal_index):
+    # "how many board-dealing phases have happened so far", so it holds
+    # for any board layout (bomb pots, double boards, hopscotch, custom
+    # flows), not just the standard 3-postflop-street case. Field kept
+    # named `street` since that's the underlying DB column name on
+    # BoardCard — only its meaning changed, not the wire name.
+    street: int
 
 
 class HypotheticalActionInput(BaseModel):
+    # Same reveal_group convention as BoardCardInput.street above — the
+    # creation_phases entry this action was taken during, i.e. "how
+    # many board reveals had happened by the time this action was
+    # taken" (0 for preflop-style action before any board is dealt).
+    # NOT a simple "which betting round is this, in order" counter —
+    # those only coincide for the simplest single-board, standard-
+    # street variants. See BoardCardInput.street's own note.
     street: int
     action_index: int = 0  # was missing — now explicit
     player_seat: int
@@ -247,7 +263,22 @@ class PhaseSnapshotDTO(BaseModel):
     phase_index: int
     phase_id: str
     deals_hole: bool
-    deals_board_street: int | None = None
+    # Renamed from the old `deals_board_street: int | None` — that
+    # field's non-None VALUE used to be trusted as the actual street
+    # number (see game_service._summarize_flow's module-level note on
+    # why that was wrong). `deals_board` is now a plain presence flag;
+    # `reveal_group` (below) is the authoritative street/reveal-order
+    # number for this phase, computed the same way for every phase
+    # (not just board-dealing ones) — see BoardCardInput.street.
+    deals_board: bool = False
+    reveal_group: int = 0
+    # Real DECISION-node domain for this phase (BETTING/CARD_SELECT/
+    # CARD_PASS/BOOLEAN/CHOICE), or None for an AUTO node. The Hand
+    # Creator wizard itself only renders BETTING phases today (see
+    # `allows_betting` below, kept for that) — this field lets a
+    # caller at least SEE a non-BETTING decision is pending here
+    # instead of it silently looking like "no decision at all".
+    decision_domain: str | None = None
     allows_betting: bool
     pot_at_start: int = 0
     hole_cards_dealt: dict[str, list[str | None]] = {}
@@ -295,7 +326,17 @@ class SaveHypotheticalHandRequest(BaseModel):
     # NEW
     discard_pile: list[str] = []
     actions: list[HypotheticalActionInput] = []
-    # NEW
+    # DEPRECATED / ignored — was never actually persisted anywhere in
+    # this file even before this pass (grep confirms no read of
+    # req.street_names below). Kept only so old Hand Creator payloads
+    # that still send it don't 400 against model_config extra="forbid".
+    # The real source of truth for street labels is now graph-derived:
+    # GET /game/variants/{game_name}/config's board_layout.street_names,
+    # keyed by reveal_group (see game_service._summarize_flow) — the
+    # SAME dict get_hypothetical_hand_edit_state() and
+    # get_hypothetical_hand() already read from for exactly this
+    # purpose. A future Hand Creator revision can drop sending this
+    # field entirely.
     street_names: dict[int, str] | None = None
 
 
@@ -397,12 +438,23 @@ def _write_hand_payload(db: Session, hand: Hand, req: SaveHypotheticalHandReques
                 db.add(
                     BoardCard(
                         hand_id=hand.hand_id,
-                        street=bc.street,  # real 1-based street, not always 1
+                        # reveal_group from creation_phases — see
+                        # BoardCardInput.street's own docstring. Not
+                        # always 1: any node not on the first
+                        # board-dealing phase gets its real group.
+                        street=bc.street,
                         node=bc.node,
                         card=cid,
                     )
                 )
     else:
+        # Legacy fallback: a flat node_cards list with no per-card
+        # street info at all — every card recorded under reveal_group
+        # 1, i.e. "the first (and only) board reveal this hand had".
+        # Correct only for a single-board-reveal hand; a caller with a
+        # genuine multi-street/multi-board layout should send
+        # req.board_cards (with real per-card reveal_group values)
+        # instead of relying on this branch.
         for node_idx, card_str_val in enumerate(req.node_cards):
             cid = parse_card(card_str_val)
             if cid is not None:
@@ -681,6 +733,15 @@ def get_hypothetical_hand_edit_state(hand_id: int, db: Session = Depends(get_db)
     Fetch a hypothetical hand decomposed into per-phase edit state, for
     re-opening in the Creator.
 
+    Each phase in `phase_snapshots` corresponds to one real node in the
+    variant's compiled flow graph (see game_service._summarize_flow),
+    walked in order. Board/action street stamps are grouped by
+    `reveal_group` — "how many board reveals had happened by this
+    point" — the same numbering a live hand's Replayer already uses,
+    not a fixed flop/turn/river index. This generalizes to any board
+    layout (bomb pots, double boards, custom flows), not just the
+    standard 3-postflop-street case.
+
     Returns phase_snapshots, initial_stacks, and furthest_phase_idx
     in addition to the base fields.
     """
@@ -702,10 +763,6 @@ def get_hypothetical_hand_edit_state(hand_id: int, db: Session = Depends(get_db)
             detail=f"Variant config not found for {hand.variant_name!r}.",
         )
     creation_phases = config.get("creation_phases") or []
-    streets_map = {
-        int(k): v
-        for k, v in ((config.get("board_layout") or {}).get("streets") or {}).items()
-    }
 
     # ── Hole cards ─────────────────────────────────────────────────
     # Only IN_HAND cards count toward the hand being re-opened for
@@ -794,27 +851,44 @@ def get_hypothetical_hand_edit_state(hand_id: int, db: Session = Depends(get_db)
         for a in actions_raw
         if a.action_index != -1
     ]
+    # Keyed by reveal_group — the SAME numbering
+    # game_service._summarize_flow computes per phase (see its
+    # module-level note) and the SAME numbering _write_hand_payload
+    # stamped onto Action.street when this hand was saved. No re-
+    # derivation needed here; just group by the value already on disk.
     actions_by_street: dict[int, list[HypotheticalActionInput]] = {}
     for a in actions_dto:
         actions_by_street.setdefault(a.street, []).append(a)
 
     # ── Walk creation_phases ───────────────────────────────────────
+    # reveal_group/deals_board/board_node_indices/decision_domain all
+    # come straight off each phase dict now — no local re-derivation
+    # of "which street is this" (that used to live here as
+    # betting_phase_counter, a separate and occasionally-diverging
+    # counter from deals_board_street's trusted value). See
+    # game_service._summarize_flow's module-level note for why a
+    # single authoritative counter, computed once in one place, is
+    # the fix.
     phase_snapshots: list[PhaseSnapshotDTO] = []
-    betting_phase_counter = 0
     hole_cards_emitted = False
     furthest_phase_idx = 0
 
     for idx, phase in enumerate(creation_phases):
         phase_id = phase.get("id", f"PHASE_{idx}")
         deals_hole = bool(phase.get("deals_hole", False))
-        deals_board_street = phase.get("deals_board_street")
+        deals_board = bool(phase.get("deals_board", False))
+        reveal_group = int(phase.get("reveal_group", 0))
+        board_node_indices = phase.get("board_node_indices") or []
+        decision_domain = phase.get("decision_domain")
         allows_betting = bool(phase.get("allows_betting", False))
 
         snap = PhaseSnapshotDTO(
             phase_index=idx,
             phase_id=phase_id,
             deals_hole=deals_hole,
-            deals_board_street=deals_board_street,
+            deals_board=deals_board,
+            reveal_group=reveal_group,
+            decision_domain=decision_domain,
             allows_betting=allows_betting,
         )
 
@@ -824,16 +898,15 @@ def get_hypothetical_hand_edit_state(hand_id: int, db: Session = Depends(get_db)
             if any(cards for cards in hole_cards_by_seat_str.values()):
                 furthest_phase_idx = max(furthest_phase_idx, idx)
 
-        if deals_board_street is not None:
-            nodes_for_street = streets_map.get(deals_board_street, [])
+        if deals_board:
             snap.board_cards_dealt = {
-                str(n): card_str_by_node.get(n) for n in nodes_for_street
+                str(n): card_str_by_node.get(n) for n in board_node_indices
             }
             if any(v is not None for v in snap.board_cards_dealt.values()):
                 furthest_phase_idx = max(furthest_phase_idx, idx)
 
         if allows_betting:
-            street_actions = actions_by_street.get(betting_phase_counter, [])
+            street_actions = actions_by_street.get(reveal_group, [])
             snap.actions = street_actions
             snap.pot_at_start = (
                 street_actions[0].pot_before
@@ -842,7 +915,6 @@ def get_hypothetical_hand_edit_state(hand_id: int, db: Session = Depends(get_db)
             )
             if street_actions:
                 furthest_phase_idx = max(furthest_phase_idx, idx)
-            betting_phase_counter += 1
 
         phase_snapshots.append(snap)
 

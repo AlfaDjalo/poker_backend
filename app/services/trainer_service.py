@@ -79,6 +79,8 @@ from poker_engine.state.poker_state import PokerState, Phase
 from poker_engine.state.player_state import PlayerState
 from poker_engine.scoring.scoring_engine import CppScoringEngine
 from poker_engine.games.loader import load_game
+# from poker_engine.games.loader import load_game
+from poker_engine.graph.graph_hole_cards import first_deal_hole_cards_count
 from poker_engine.actions.action import Action as EngineAction
 from poker_engine.actions.action_type import ActionType as EngineActionType
 from poker_engine.cards.mask import mask_to_card_ids
@@ -87,6 +89,7 @@ from poker_engine.cards.card import Card as CardObj
 from poker_rl_lab.envs.observations import HoleCardsObs
 
 from app.config.trainer_config import ScenarioConfig, get_training_config
+from app.services import graph_scenario_trainer as _graph
 from app.services.decision_evaluator import (
     DecisionContext,
     DecisionResult,
@@ -539,53 +542,41 @@ def _try_build_real_agent(
     scenario: ScenarioConfig, checkpoint_path: str | None = None
 ) -> Tuple[Any, List[Dict[str, Any]]]:
     """
-    Attempt to build/load the real DualSeatActorCritic for this
-    scenario's policy config, recording a step-by-step trace of every
-    point along the way that could silently substitute a fallback.
+    GRAPH-ENGINE EDITION.
 
-    Why a trace and not just a final status
-    -------------------------------------------
-    There are THREE independent things that can each silently degrade
-    without raising, and a caller only checking "is agent_class
-    RandomFallbackAgent?" misses two of them entirely:
+    Loads via poker_rl_lab.trainers.graph_training_loop
+    .load_dual_seat_actor_critic_for_graph() — the same loader
+    push_fold_duo_hand_grids.py's CLI uses to build hand grids from a
+    graph-trained checkpoint. Variant/action_dim are read straight out
+    of the checkpoint's own saved metadata (see
+    save_checkpoint()/load_dual_seat_actor_critic_for_graph() in
+    graph_training_loop.py), so there is no scenario.policy.variant to
+    parse/mismatch against a checkpoint anymore, and no separate
+    PretrainedHandEncoder resolution step on THIS side — the loader
+    resolves its own hand encoder internally (via
+    load_default_hand_encoder() when none is passed) when the
+    checkpoint doesn't embed one. scenario.policy.encoder_path /
+    encoder_embedding_dim are therefore unused by this function now;
+    left in ScenarioConfig for backward compatibility with any
+    scenario file that still sets them, but they have no effect here.
 
-      1. Checkpoint weights: real file loaded vs. missing/failed vs.
-         RandomFallbackAgent (no network at all).
-      2. Hand encoder: the PRETRAINED base card-set encoder
-         (representation/pretrained_hand_encoder.py) that the loaded
-         checkpoint's own adapter layers (attn_scorer/project) were
-         TRAINED ON TOP OF. If scenario.policy.encoder_path fails to
-         load, the checkpoint's policy/value weights can still load
-         successfully (they don't include the frozen TF base encoder's
-         weights at all — see composite_hand_encoder.py's own
-         docstring: "NOT registered as an nn.Module (TF-backed,
-         frozen)") while the base encoder underneath silently becomes
-         an UNTRAINED one. The resulting agent_class and
-         checkpoint_exists_on_disk both look completely normal in that
-         case — only the hand-encoder step of this trace catches it.
-      3. Architecture variant mismatch: a checkpoint saved with one
-         PolicyVariant loaded against the other raises inside
-         load_state_dict (a real error, caught and traced below) — but
-         a MATCHING variant with a genuinely wrong/stale checkpoint
-         path would load "successfully" while pointing at the wrong
-         model entirely; that can only be caught by cross-checking
-         checkpoint_path against what you expect it to be, which is
-         why get_debug_info() reports the full resolved absolute path.
-
-    This function ALWAYS resolves hand_encoder explicitly (never
-    passes hand_encoder=None into build_dual_seat_actor_critic /
-    load_dual_seat_actor_critic) specifically so it never silently
-    falls through to those functions' own hidden default — which
-    reads from a hardcoded path
-    (generic_tree_experiment._DEFAULT_ENCODER_PATH) that has nothing
-    to do with scenario.policy.encoder_path — without this trace ever
-    knowing that happened.
+    REPLACES the old poker_rl_lab.experiments.generic_tree_experiment
+    -based loader wholesale (build_dual_seat_actor_critic /
+    load_dual_seat_actor_critic / PolicyVariant / the legacy-
+    architecture reconstruction fallback) rather than trying both — a
+    checkpoint trained under the new graph pipeline is a different
+    architecture (see graph_training_loop.py), not expected to load
+    through the old loader, and vice versa. If some OTHER scenario
+    still needs to serve a pre-graph-migration checkpoint, that would
+    need a distinct loader entirely — flag it if that's a real case,
+    since every scenario in this registry goes through this one
+    function today.
 
     Returns
     -------
     (agent_or_None, trace)
-        agent is None if every step failed and the caller should fall
-        back to RandomFallbackAgent (see _AgentCache.get_agent).
+        agent is None if the checkpoint couldn't be loaded — caller
+        (_AgentCache.get_agent) falls back to RandomFallbackAgent.
     """
     trace: List[Dict[str, Any]] = []
 
@@ -593,12 +584,11 @@ def _try_build_real_agent(
         trace.append({"step": name, "status": status, "detail": detail})
 
     try:
-        from poker_rl_lab.experiments.generic_tree_experiment import (
-            build_dual_seat_actor_critic,
-            load_dual_seat_actor_critic,
-            PolicyVariant,
+        from poker_rl_lab.trainers.graph_training_loop import (
+            load_dual_seat_actor_critic_for_graph,
         )
-        step("import_rl_lab", "ok", "poker_rl_lab.experiments.generic_tree_experiment imported.")
+        step("import_rl_lab", "ok",
+             "poker_rl_lab.trainers.graph_training_loop imported.")
     except ImportError as e:
         step("import_rl_lab", "error", f"RL Lab not importable: {e}")
         return None, trace
@@ -611,148 +601,45 @@ def _try_build_real_agent(
     checkpoint_path = checkpoint_path or scenario.policy.checkpoint_path
     abs_checkpoint_path = os.path.abspath(checkpoint_path)
 
-    try:
-        variant = PolicyVariant(scenario.policy.variant)
-        step("parse_variant", "ok", f"variant={variant.value!r}")
-    except ValueError as e:
-        step("parse_variant", "error", f"unknown variant {scenario.policy.variant!r}: {e}")
-        return None, trace
-
-    # -- Hand encoder: resolved explicitly, never left as None --------
-    hand_encoder = None
-    encoder_source = None
-    if not scenario.policy.encoder_path:
-        step("hand_encoder", "warning",
-             "no encoder_path configured for this scenario.")
-    elif not os.path.exists(scenario.policy.encoder_path):
-        step("hand_encoder", "warning",
-             f"encoder_path {os.path.abspath(scenario.policy.encoder_path)!r} "
-             f"does not exist on disk.")
-    else:
-        try:
-            from poker_rl_lab.representation.pretrained_hand_encoder import PretrainedHandEncoder
-            hand_encoder = PretrainedHandEncoder.from_file(
-                scenario.policy.encoder_path,
-                expected_embedding_dim=scenario.policy.encoder_embedding_dim,
-            )
-            encoder_source = "configured_pretrained_file"
-            step("hand_encoder", "ok",
-                 f"loaded pretrained hand encoder from "
-                 f"{os.path.abspath(scenario.policy.encoder_path)} "
-                 f"(embedding_dim={hand_encoder.embedding_dim}).")
-        except Exception as e:
-            step("hand_encoder", "error",
-                 f"failed to load hand encoder from "
-                 f"{os.path.abspath(scenario.policy.encoder_path)!r}: "
-                 f"{type(e).__name__}: {e}")
-
-    if hand_encoder is None:
-        from poker_rl_lab.representation.pretrained_hand_encoder import PretrainedHandEncoder
-        hand_encoder = PretrainedHandEncoder.untrained()
-        encoder_source = "untrained_fallback"
-        step("hand_encoder_fallback", "fallback",
-             "Using an UNTRAINED base hand encoder — even if the "
-             "checkpoint below loads without error, its policy/value "
-             "weights were trained on top of REAL card embeddings and "
-             "are now seeing random ones instead. This will NOT raise "
-             "an exception and will NOT show up as agent_class == "
-             "RandomFallbackAgent — check this step specifically.")
-
-    # -- Checkpoint weights ---------------------------------------------
     if not os.path.exists(checkpoint_path):
         step("checkpoint", "warning", f"no file at {abs_checkpoint_path!r}.")
     else:
         try:
-            agent = load_dual_seat_actor_critic(
-                checkpoint_path, variant=variant, hand_encoder=hand_encoder
+            agent = load_dual_seat_actor_critic_for_graph(
+                checkpoint_path, device="cpu"
             )
             step("checkpoint", "ok",
-                 f"loaded checkpoint from {abs_checkpoint_path} "
-                 f"(variant={variant.value}, hand_encoder={encoder_source}, "
-                 f"architecture=current).")
-            agent._trainer_debug_encoder_source = encoder_source  # noqa: SLF001 — debug-only tag
-            agent._trainer_debug_architecture = "current"  # noqa: SLF001
+                 f"loaded graph checkpoint from {abs_checkpoint_path} "
+                 f"(variant/action_dim read from checkpoint metadata; "
+                 f"hand encoder resolved internally by the loader).")
+            agent._trainer_debug_encoder_source = "resolved_by_graph_loader"  # noqa: SLF001
+            agent._trainer_debug_architecture = "graph"  # noqa: SLF001
             return agent, trace
-        except RuntimeError as e:
-            msg = str(e)
-            if "Missing key" in msg or "Unexpected key" in msg:
-                # Not a corrupt file or wrong variant — the checkpoint's
-                # actual saved shapes don't match what
-                # actor_critic_factory.build_actor_critic() currently
-                # constructs (CompositeHandEncoder/CompositeBoardEncoder).
-                # This is exactly the signature of a checkpoint saved
-                # BEFORE that refactor — see
-                # generic_tree_experiment.py's "Legacy-architecture
-                # builders/loaders" section. Try reconstructing that
-                # older shape instead of giving up straight to
-                # untrained.
-                step("checkpoint", "warning",
-                     f"file EXISTS at {abs_checkpoint_path!r} but its "
-                     f"state_dict doesn't match the CURRENT architecture "
-                     f"(missing/unexpected keys — see raw error below). "
-                     f"This is the signature of a checkpoint saved before "
-                     f"the CompositeHandEncoder/CompositeBoardEncoder "
-                     f"refactor. Attempting a legacy-architecture load. "
-                     f"Raw error: {msg}")
-                try:
-                    from poker_rl_lab.experiments.generic_tree_experiment import (
-                        load_dual_seat_actor_critic_legacy,
-                    )
-                    agent = load_dual_seat_actor_critic_legacy(
-                        checkpoint_path, variant=variant, hand_encoder=hand_encoder
-                    )
-                    step("checkpoint_legacy", "ok",
-                         f"loaded checkpoint from {abs_checkpoint_path} "
-                         f"using the LEGACY (pre-composite-encoder) "
-                         f"architecture. This is a best-effort "
-                         f"reconstruction using default hyperparameters "
-                         f"for every component the mismatch doesn't "
-                         f"directly implicate — if this checkpoint used "
-                         f"non-default encoder sizes anywhere, this may "
-                         f"still be silently wrong. Consider re-exporting "
-                         f"a checkpoint against the current architecture "
-                         f"when possible.")
-                    agent._trainer_debug_encoder_source = encoder_source  # noqa: SLF001
-                    agent._trainer_debug_architecture = "legacy"  # noqa: SLF001
-                    return agent, trace
-                except ImportError as e2:
-                    step("checkpoint_legacy", "error",
-                         f"legacy loader not available — add "
-                         f"build_dual_seat_actor_critic_legacy/"
-                         f"load_dual_seat_actor_critic_legacy to "
-                         f"generic_tree_experiment.py. ({e2})")
-                except Exception as e2:
-                    step("checkpoint_legacy", "error",
-                         f"legacy-architecture load also failed: "
-                         f"{type(e2).__name__}: {e2}")
-            else:
-                step("checkpoint", "error",
-                     f"file EXISTS at {abs_checkpoint_path!r} but failed "
-                     f"to load: {type(e).__name__}: {e}")
         except Exception as e:
             step("checkpoint", "error",
                  f"file EXISTS at {abs_checkpoint_path!r} but failed to "
-                 f"load: {type(e).__name__}: {e}")
+                 f"load via load_dual_seat_actor_critic_for_graph: "
+                 f"{type(e).__name__}: {e}")
 
     if not scenario.policy.allow_untrained_fallback:
         step("untrained_fallback", "error",
              "allow_untrained_fallback is False — no agent could be built.")
         return None, trace
 
-    try:
-        agent = build_dual_seat_actor_critic(variant, hand_encoder=hand_encoder)
-        agent.eval()
-        step("untrained_fallback", "fallback",
-             f"Using an UNTRAINED policy network (architecture matches "
-             f"variant={variant.value}, but random init — no real poker "
-             f"knowledge) in place of {abs_checkpoint_path!r}.")
-        agent._trainer_debug_encoder_source = encoder_source  # noqa: SLF001
-        agent._trainer_debug_architecture = "current (untrained)"  # noqa: SLF001
-        return agent, trace
-    except Exception as e:
-        step("untrained_fallback", "error",
-             f"failed to build even an untrained agent: {type(e).__name__}: {e}")
-        return None, trace
+    # No confirmed graph-native equivalent of the old "build an
+    # untrained network of the right shape" constructor is wired up
+    # yet (unlike load_dual_seat_actor_critic_for_graph, which reads
+    # architecture off an EXISTING checkpoint's metadata — there's
+    # nothing to read metadata from when there's no file at all).
+    # Falls through to RandomFallbackAgent via _AgentCache.get_agent's
+    # own final_fallback step rather than guessing at a constructor
+    # signature. If poker_rl_lab exposes a real "build untrained graph
+    # actor-critic" function, wire it in here.
+    step("untrained_fallback", "warning",
+         "no graph-native 'build untrained' constructor wired up yet — "
+         "falling through to RandomFallbackAgent instead of an "
+         "untrained-but-correctly-shaped network.")
+    return None, trace
 
 
 # ---------------------------------------------------------------------------
@@ -842,6 +729,25 @@ class TrainerService:
         # hole cards/board actually differ).
         self._hand_id: int = 0
 
+        # GameDefinition (graph-native shape, now returned by the
+        # unified load_game()) no longer carries .hole_cards at all —
+        # see game_definition.py's own docstring. Derived once per
+        # scenario in _new_scenario_once() via
+        # graph_hole_cards.first_deal_hole_cards_count(graph) and
+        # cached here for get_hand_grid()'s 2-hole-card gate, which
+        # previously read self.state.game_def.hole_cards directly.
+        self._hole_cards_count: Optional[int] = None
+
+        # GraphScenarioEnv-backed session for scenarios that have opted
+        # into the GraphEngine migration (cfg.is_graph_migrated()) — see
+        # app/services/graph_scenario_trainer.py. None whenever the
+        # active scenario is still on the legacy PokerState path (every
+        # scenario except push_fold_duo, as of the first migration PR).
+        # Exactly one of (self.state, self._graph_session) is live at a
+        # time; which one is determined by scenario_key's own
+        # is_graph_migrated() each time it matters.
+        self._graph_session = None
+
     # ------------------------------------------------------------
     # Scenario listing
     # ------------------------------------------------------------
@@ -859,13 +765,25 @@ class TrainerService:
             # training_config.yaml, since the Engine yaml is already
             # the source of truth for that.
             print("Scenario: ", s)
-            game_def, _ = load_game(s.engine_variant)
+            game_def, rules = load_game(s.engine_variant)
             result.append({
                 "key": s.key,
                 "label": s.label,
                 "description": s.description,
                 "hole_cards": game_def.hole_cards,
             })
+            # game_def, rules, graph = load_game(s.engine_variant)
+            # result.append({
+            #     "key": s.key,
+            #     "label": s.label,
+            #     "description": s.description,
+            #     # first_deal_hole_cards_count soft-fails to None rather
+            #     # than raising — same "don't 500 a whole listing over
+            #     # one scenario's hole-card derivation" rationale
+            #     # equity_service.py documents for its own (hard-fail)
+            #     # sibling helper.
+            #     "hole_cards": first_deal_hole_cards_count(graph),
+            # })
         return result
 
     # ------------------------------------------------------------
@@ -998,7 +916,14 @@ class TrainerService:
         cfg = get_training_config().get_scenario(scenario_key)
         self.scenario_key = scenario_key
 
+        if cfg.is_graph_migrated():
+            return self._new_scenario_once_graph(cfg)
+        self._graph_session = None
+
         game_def, rules = load_game(cfg.engine_variant)
+        self._hole_cards_count = game_def.hole_cards
+        # game_def, rules, graph = load_game(cfg.engine_variant)
+        # self._hole_cards_count = first_deal_hole_cards_count(graph)
 
         hero_bb = round(random.uniform(cfg.stack_bb.min, cfg.stack_bb.max), 1)
         if cfg.villain_matches_hero_range:
@@ -1006,7 +931,13 @@ class TrainerService:
         else:
             villain_bb = hero_bb
 
-        big_blind = game_def.big_blind
+        # GameDefinition no longer carries big_blind (see
+        # game_definition.py's docstring) — every scenario YAML already
+        # declares its own small_blind/big_blind (training_config.yaml /
+        # trainer_scenarios/*.yaml), which is the real source of truth
+        # here now; must agree with the variant YAML's own post_blinds
+        # flow step, same caveat noted elsewhere for this migration.
+        big_blind = cfg.big_blind
         hero_chips = max(big_blind, round(hero_bb * big_blind))
         villain_chips = max(big_blind, round(villain_bb * big_blind))
 
@@ -1057,7 +988,7 @@ class TrainerService:
         # actually implemented — river hands were silently being dealt
         # as if 1/2 blinds had been posted instead of a randomized
         # stack-to-pot ratio.
-        self._apply_dead_pot(cfg, game_def)
+        self._apply_dead_pot(cfg)
 
         # Defensive check: fail loudly in dev if this ever drifts again,
         # rather than silently serving the wrong action set to the
@@ -1094,6 +1025,29 @@ class TrainerService:
 
         return self.get_state()
 
+    def _new_scenario_once_graph(self, cfg: ScenarioConfig) -> Dict[str, Any]:
+        """
+        GraphScenarioEnv-backed counterpart of _new_scenario_once() —
+        see graph_scenario_trainer.new_graph_scenario() for the actual
+        session construction. Mirrors the legacy method's own
+        bookkeeping (self.hero_position/self.hero_effective_bb/
+        self.awaiting_hero/self._hand_id/self._pending_grade_*/
+        self._action_log are all still read by get_state()'s shared
+        tail — see that method's own dispatch) so both paths present an
+        identical TrainerService-level surface to trainer_api.py.
+        """
+        self._hand_id += 1
+        self._pending_grade_result = None
+        self._pending_grade_extra = {}
+        self._action_log = []
+
+        self._graph_session = _graph.new_graph_scenario(cfg, hand_id=self._hand_id)
+        self.hero_position = self._graph_session.hero_position
+        self.hero_effective_bb = self._graph_session.hero_effective_bb
+        self.awaiting_hero = self._graph_session.awaiting_hero
+
+        return self.get_state()
+
     # Fallback dead-pot range (in big blinds) used when a non-push-fold
     # scenario has no cfg.pot_bb configured at all — guarantees a real
     # randomized pot instead of silently leaving start_hand()'s posted
@@ -1103,7 +1057,7 @@ class TrainerService:
     # this code, whatever the cause).
     _DEFAULT_DEAD_POT_BB_RANGE = (10.0, 40.0)
 
-    def _apply_dead_pot(self, cfg: ScenarioConfig, game_def) -> None:
+    def _apply_dead_pot(self, cfg: ScenarioConfig) -> None:
         """
         Overrides start_hand()'s blind-posting with a randomized dead
         pot, per a scenario's PotConfig(mode="randomized_bb") semantics
@@ -1127,7 +1081,7 @@ class TrainerService:
             return
 
         g = self.state.game
-        big_blind = game_def.big_blind
+        big_blind = cfg.big_blind
 
         if cfg.pot_bb is not None:
             pot_min, pot_max = cfg.pot_bb.min, cfg.pot_bb.max
@@ -1295,7 +1249,7 @@ class TrainerService:
     # ------------------------------------------------------------
 
     def apply_hero_action(self, action_type: str) -> Dict[str, Any]:
-        if self.state is None or self.scenario_key is None:
+        if self.scenario_key is None or (self.state is None and self._graph_session is None):
             raise ValueError("No active trainer scenario. Call new_scenario() first.")
 
         if self._busy:
@@ -1305,6 +1259,9 @@ class TrainerService:
         self._busy = True
         try:
             cfg = get_training_config().get_scenario(self.scenario_key)
+
+            if cfg.is_graph_migrated():
+                return self._apply_hero_action_graph(cfg, action_type)
 
             if not self._is_hero_turn(cfg):
                 raise ValueError("Not the hero's turn to act.")
@@ -1378,6 +1335,46 @@ class TrainerService:
             return payload
         finally:
             self._busy = False
+
+    def _apply_hero_action_graph(self, cfg: ScenarioConfig, action_type: str) -> Dict[str, Any]:
+        """
+        Graph-migrated counterpart of apply_hero_action()'s body above
+        — delegates the actual GraphScenarioEnv stepping/grading to
+        graph_scenario_trainer.apply_hero_action_graph(), then records
+        into the SAME shared Scoreboard the legacy path uses, so
+        scoreboard accuracy/history stays continuous regardless of
+        which path produced any given entry. Called with self._busy
+        already held by the caller (apply_hero_action), same locking
+        the legacy branch relies on.
+        """
+        if self._graph_session is None:
+            raise ValueError("No active trainer scenario. Call new_scenario() first.")
+
+        result_dict = _graph.apply_hero_action_graph(self._graph_session, cfg, action_type)
+        self.awaiting_hero = self._graph_session.awaiting_hero
+
+        payload = self.get_state()
+        payload["last_decision"] = {
+            "correct": result_dict["correct"],
+            "best_action": result_dict["best_action"],
+            "hero_action": result_dict["hero_action"],
+            "explanation": result_dict["explanation"],
+        }
+
+        decision_result = DecisionResult(
+            correct=result_dict["correct"],
+            best_action=result_dict["best_action"],
+            hero_action=result_dict["hero_action"],
+            explanation=result_dict["explanation"],
+        )
+        entry_id = self.scoreboard.record(
+            decision_result,
+            extra=self._graph_session.pending_grade_extra,
+            state_snapshot=payload,
+        )
+        payload["scoreboard_entry_id"] = entry_id
+        payload["scoreboard"] = self.scoreboard.as_dict()
+        return payload
 
     def reset_scoreboard(self) -> Dict[str, Any]:
         self.scoreboard.reset()
@@ -1553,14 +1550,18 @@ class TrainerService:
               }
             }
         """
+        if self._graph_session is not None:
+            cfg = get_training_config().get_scenario(self.scenario_key)
+            return _graph.compute_hand_grid_graph(self._graph_session, cfg)
+
         if self.state is None or self.scenario_key is None:
             raise ValueError("No active trainer scenario. Call new_scenario() first.")
 
-        if self.state.game_def.hole_cards != 2:
+        if self._hole_cards_count != 2:
             raise ValueError(
                 f"Hand grid is only available for 2-hole-card games — "
                 f"scenario {self.scenario_key!r} deals "
-                f"{self.state.game_def.hole_cards} hole cards per player "
+                f"{self._hole_cards_count!r} hole cards per player "
                 f"(e.g. Omaha), for which the 169-combo canonical grid "
                 f"isn't a meaningful concept."
             )
@@ -1636,11 +1637,14 @@ class TrainerService:
 
         cfg = get_training_config().get_scenario(scenario_key)
 
-        game_def, _ = load_game(cfg.engine_variant)
-        if game_def.hole_cards != 2:
+        game_def, rules = load_game(cfg.engine_variant)
+        hole_cards = game_def.hole_cards
+        # game_def, rules, graph = load_game(cfg.engine_variant)
+        # hole_cards = first_deal_hole_cards_count(graph)
+        if hole_cards != 2:
             raise ValueError(
                 f"Hand grid is only available for 2-hole-card games — "
-                f"scenario {scenario_key!r} deals {game_def.hole_cards} "
+                f"scenario {scenario_key!r} deals {hole_cards!r} "
                 f"hole cards per player (e.g. Omaha), for which the "
                 f"169-combo canonical grid isn't a meaningful concept."
             )
@@ -2260,7 +2264,7 @@ class TrainerService:
             # Aggressive = a real bet-like action (this scenario's
             # action_map declares sizing "pot" OR "stack" for it — see
             # ScenarioConfig.is_bet_like) or an outright shove — never a
-            # hardcoded "bet" string check, so a scenario with a
+            # hardcoded "bet" string check, so a scenario w
             # differently-named bet action (e.g. "bet_half", or
             # river_duo's own "bet" at sizing: stack) is still correctly
             # flagged as the street's aggressor. Previously this checked
@@ -2285,6 +2289,10 @@ class TrainerService:
     # ------------------------------------------------------------
 
     def get_state(self) -> Dict[str, Any]:
+        if self._graph_session is not None:
+            cfg = get_training_config().get_scenario(self.scenario_key)
+            return _graph.get_state_dto_graph(self._graph_session, cfg)
+
         if self.state is None:
             return {"active": False}
 

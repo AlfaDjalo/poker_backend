@@ -25,6 +25,7 @@ class SessionLogger:
         self.session_id = None
         self.hand_id = None
         self._logged_nodes = set()
+        self._logged_hole_cards: dict[int, set[int]] = {}
 
     def start_game(self, config):
         """Start a new poker session for the given table."""
@@ -74,39 +75,38 @@ class SessionLogger:
 
         self.hand_id = hand.hand_id
         self._logged_nodes = set()
-        # BoardCard.street used to be a real 1-based street index,
-        # derived either from game_def.street_nodes (legacy PokerState
-        # path) or from a graph-walk reconstruction
-        # (graph_engine_callbacks._node_street_map_from_graph, which
-        # made unconfirmed assumptions about graph.node(...).metadata
-        # key names and silently fell back to {} on any mismatch).
-        # Under GraphEngine there IS no structural "street" — the
-        # engine only knows node positions and decision points, not
-        # street indices — so reconstructing one from graph metadata
-        # was fighting the architecture, not modeling it. When that
-        # reconstruction silently failed, log_board()'s old
-        # `self._node_to_street_map.get(node, 1)` fallback stamped
-        # EVERY board card (flop, turn, river alike) with street=1,
-        # which is exactly why the Hand Replayer revealed the whole
-        # board on the very first frame.
+
+        # --------------------------------------------------------------
+        # THE ONE STREET COUNTER — single source of truth for "what
+        # street is this hand on right now", shared by every table that
+        # stamps a `street` column (BoardCard, Action, HoleCard/
+        # CardEvent via log_hole_cards). Starts at 0 (preflop — no board
+        # cards revealed yet) and is incremented ONLY by log_board(),
+        # exactly when a genuinely new batch of board cards is observed.
         #
-        # Fixed by dropping street reconstruction entirely: `street`
-        # on BoardCard now just records REVEAL ORDER — a small
-        # monotonically increasing group number, incremented each time
-        # log_board() observes a NEW batch of cards. Cards dealt
-        # together (a simultaneous double-flop bomb pot, a single-node
-        # river drop, etc.) naturally share a group; cards dealt in a
-        # later engine pass naturally get a higher one. This is
-        # derived purely from the actual order cards appeared in
-        # node_cards, so it's correct for ANY flow graph — standard,
-        # bomb pot, hopscotch, funnel, whatever — with zero graph
-        # introspection and zero per-variant assumptions.
+        # Previously Action.street/hole_card_events[].street were
+        # derived SEPARATELY, by walking the compiled GameGraph and
+        # reading a `street_index` value off each node's metadata
+        # (graph_engine_callbacks.py's now-removed
+        # _betting_node_street_map/_card_node_street_map/
+        # _all_nodes_street_map). That's fragile in two ways: (1) it
+        # assumes the compiled graph node's metadata dict preserves the
+        # flow YAML's `street_index` key verbatim, which was never
+        # actually confirmed against the real graph loader and turned
+        # out to still be wrong; and (2) even when it "worked", it was
+        # computing street from a DIFFERENT signal than BoardCard.street
+        # (reveal order) — the two numbering schemes are only
+        # guaranteed to agree for the simplest single-board, standard-
+        # street variants, and can drift apart for bomb pots, multi-
+        # board/hopscotch layouts, or any custom flow.
         #
-        # `game_def`/`node_street_map` config keys are still accepted
-        # (and still passed by graph_engine_callbacks.py /
-        # engine_callbacks.py) but are no longer consumed here — kept
-        # only so neither caller needs a matching change to stop
-        # passing them.
+        # Deriving every street-stamped table from THIS SAME counter
+        # instead removes the graph entirely from the question: no
+        # matter what the flow graph/layout looks like, "which street
+        # is this action on" is defined identically to "how many board
+        # reveals have happened so far", which is exactly what the
+        # frontend's replay reconstruction needs to key frames on.
+        # --------------------------------------------------------------
         self._board_reveal_index = 0
 
         players_list = config.get("players", [])
@@ -135,7 +135,24 @@ class SessionLogger:
                     visible=True,
                 )
 
+        self._logged_hole_cards = {
+            player_index: set(mask_to_card_ids(p.hand_mask))
+            for player_index, p in enumerate(players_list)
+        }
+
         self.db.commit()
+
+    def current_street(self) -> int:
+        """
+        The street value every OTHER logging call should stamp right
+        now — see self._board_reveal_index's docstring in start_hand()
+        for why this single counter (not graph metadata) is the source
+        of truth. Callers (graph_engine_callbacks.py) call this
+        immediately after log_board() has had a chance to run for the
+        current engine state, so a board reveal that just happened as
+        part of this same AUTO-walk is already reflected here.
+        """
+        return self._board_reveal_index
 
     def log_action(
         self,
@@ -209,11 +226,20 @@ class SessionLogger:
         Log any board cards that have been dealt but not yet recorded.
         Safe to call multiple times — tracks which nodes have already
         been logged and stamps every NEW batch of cards observed in a
-        single call with the same reveal-order group number (see
-        self._board_reveal_index's docstring in start_hand()). Cards
-        dealt across separate calls (i.e. separate deal points in the
-        flow graph) get strictly increasing group numbers, regardless
-        of how many nodes each deal point fills.
+        single call with the same reveal-order group number
+        (self._board_reveal_index — see its docstring in start_hand()).
+        Cards dealt across separate calls (i.e. separate deal points in
+        the flow graph) get strictly increasing group numbers,
+        regardless of how many nodes each deal point fills.
+
+        THIS is the one place _board_reveal_index is ever incremented
+        — every other street-stamped write (log_action,
+        log_card_select, log_card_pass, log_hole_cards) reads it via
+        current_street() but never advances it, so as long as callers
+        call log_board() before those other methods for the same
+        engine-state snapshot (graph_engine_callbacks.py already does
+        this), everything stays in lockstep with zero possibility of
+        drift between BoardCard.street and every other table's street.
         """
         g = state.game
 
@@ -244,6 +270,15 @@ class SessionLogger:
 
         # Log any board cards not yet captured.
         self.log_board(state)
+        # No explicit street resolver is available here (finish_hand
+        # is called from on_showdown, past the point any caller has a
+        # meaningful "current node" to walk from) — fall back to
+        # current_street() the same way every other caller does now,
+        # rather than the engine's own g.street_index (a sequential
+        # betting-round counter with completely different numbering —
+        # see log_hole_cards()'s own note on why that fallback was
+        # wrong).
+        self.log_hole_cards(state)
 
         result = state.last_showdown
         if not result:
@@ -318,3 +353,75 @@ class SessionLogger:
         val = self._action_index
         self._action_index += 1
         return val
+
+    def log_hole_cards(self, state, street=None):
+        """
+        Log any hole cards that entered a player's hand SINCE the last
+        call (or since start_hand()) — the mid-hand analog of
+        log_board() for BOARD cards. Two mechanics rely on this:
+
+            - Extra Card AUTO handlers (ESG, Catchup ESG, Christmas,
+            Grinch's deal_extra_hole_card) hand a player one or more
+            NEW cards directly into hand_mask with no DECISION node
+            involved at all — nothing else in the callback chain ever
+            observes this, so without this method those cards are
+            live in-game (state_to_dto reads hand_mask fresh every
+            call) but permanently missing from HoleCard/CardEvent, and
+            therefore invisible on replay.
+            - A CARD_SELECT redraw (replace_from_deck: true, e.g.
+            Drawmaha) — the discarded cards are logged explicitly via
+            log_card_select()/discard_card(), but the REPLACEMENT
+            cards drawn back in were never logged by anything until
+            now; they show up here as a same-shaped diff.
+
+        Safe to call repeatedly (idempotent), same contract as
+        log_board().
+
+        `street` — the street ordinal (same convention BoardCard.street
+        / Action.street already use — see current_street()'s
+        docstring) to stamp on any NEW cards found this call. Callers
+        that have already called log_board() for this same engine-
+        state snapshot (graph_engine_callbacks.py's on_decision() /
+        on_cards_distributed()) should pass self.current_street()
+        explicitly, which is exactly what "the street this card was
+        actually dealt on" means now.
+
+        Falls back to current_street() when omitted (street=None) —
+        this used to fall back to state.game.street_index (the
+        engine's own sequential betting-round counter, a DIFFERENT
+        numbering from BoardCard.street's reveal-order — see
+        current_street()'s own docstring for why that mismatch was a
+        bug in its own right), which is what made an ESG/Christmas/
+        pass-the-trash extra card show up under the wrong street in
+        the Hand Replayer. The only caller that still relies on this
+        fallback is finish_hand()'s own trailing call, which has no
+        specific engine-state snapshot to derive a street from other
+        than "whatever the count is right now".
+        """
+        g = state.game
+
+        if street is None:
+            street = self.current_street()
+
+        for player_index, actual_player_id in enumerate(self.active_player_ids):
+            if player_index >= len(g.players):
+                continue
+            p = g.players[player_index]
+            current = set(mask_to_card_ids(p.hand_mask))
+            logged = self._logged_hole_cards.setdefault(player_index, set())
+            new_cards = current - logged
+            if not new_cards:
+                continue
+
+            for card in sorted(new_cards):
+                deal_card(
+                    self.db,
+                    hand_id=self.hand_id,
+                    player_id=actual_player_id,
+                    card=card,
+                    street=street,
+                    visible=True,
+                )
+                logged.add(card)
+
+        self.db.commit()

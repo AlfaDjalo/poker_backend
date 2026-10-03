@@ -35,12 +35,12 @@ DecisionResponse's real shape, per the migration doc's "Run a hand"
 example:
     response = DecisionResponse(req.node_id, req.domain, req.player_index, value)
 i.e. positional (node_id, domain, player_index, value) — NOT the
-(action_type, amount) kwargs the previous revision of this file
-assumed. `value` is now CONFIRMED for the BETTING domain: a real
+(action_type, amount) kwargs an earlier revision of this file assumed.
+`value` is CONFIRMED for the BETTING domain: a real
 poker_engine.actions.action.Action(type=ActionType, amount=int) — see
 game_service.py's _build_decision_response, which was fixed after
 BettingResolver.validate() raised "response.value must be an Action"
-at runtime against the previous plain-dict shape. on_decision() below
+at runtime against an earlier plain-dict shape. on_decision() below
 reads `.type` (unwrapped via `.name` to a string, e.g. "FOLD") off
 `value` as the primary path, with dict / bare-`.action_type`-attribute
 handling kept only as a defensive fallback for any other domain whose
@@ -53,10 +53,43 @@ engine card ids the player selected from their OWN hand (see
 core_types.py: "CARD_SELECT/CARD_PASS -> Tuple[int,...]", and
 game_service.py's _build_card_select_decision_response, which builds
 exactly this shape). Neither domain is BETTING-shaped, so on_decision()
-now checks the response's domain FIRST and routes to
-_log_card_decision() before falling into the Action-shaped BETTING
-logic below — see that method's own docstring for the CARD_SELECT vs.
-CARD_PASS split and the pass_direction resolution it depends on.
+checks the response's domain FIRST and routes to _log_card_decision()
+before falling into the Action-shaped BETTING logic below — see that
+method's own docstring for the CARD_SELECT vs. CARD_PASS split.
+
+Street resolution — REWRITTEN, no more graph walking
+-----------------------------------------------------------------
+Every street stamped anywhere (Action.street, hole_card_events[].street,
+BoardCard.street) now comes from ONE counter:
+SessionLogger.current_street() — see that class's own docstring on
+self._board_reveal_index for the full rationale. This file previously
+tried to derive "which street is this node on" by walking the compiled
+GameGraph and reading a `street_index` value off each node's metadata.
+That was fragile in two independent ways that both turned out to bite:
+  (1) it assumed the compiled graph node's metadata dict preserves the
+      flow YAML's `street_index` key verbatim — never actually
+      confirmed against the real graph loader, and apparently wrong
+      (board cards still weren't showing up on the right frames after
+      that "fix").
+  (2) even when correct, it computed street from a DIFFERENT signal
+      than BoardCard.street (reveal order), which are only guaranteed
+      to agree for the simplest single-board standard-street variants
+      — a bomb pot, multi-board/hopscotch layout, or any custom flow
+      could silently disagree between the two.
+Deriving every street-stamped write from SessionLogger's own reveal
+counter removes the graph from the question entirely: "which street is
+this on" is now identically defined as "how many board reveals have
+happened so far", for every table, for every layout, with zero graph
+introspection and zero chance of the two numbering schemes drifting
+apart. All the graph-walking helper functions that used to live in
+this file (_street_index_from_metadata, _node_street_map_from_graph,
+_betting_node_street_map, _card_node_street_map, _all_nodes_street_map,
+_street_index_for_node, _card_street_index_for_node,
+_current_node_street) are gone — callers just call
+self.logger.current_street() directly, always AFTER log_board() has
+had a chance to observe any board cards revealed as part of the same
+AUTO-walk (on_decision()/on_cards_distributed() already call log_board()
+first, so this ordering is preserved).
 
 Remaining ASSUMPTIONS not yet confirmed against real source:
   - callbacks.on_hand_start(engine, game_def) fires once per new hand
@@ -72,13 +105,8 @@ Remaining ASSUMPTIONS not yet confirmed against real source:
   - CARD_PASS's target seat: the engine resolves it internally
     (CardPassResolver, from a fixed "left"/"right" config rule — see
     game_api.py's ActionRequest docstring) and it is NOT part of
-    `response`. _log_card_decision() below assumes the current graph
-    node's `metadata` carries a `pass_direction` key ("left"|"right")
-    describing that same rule — same mechanism
-    _betting_node_street_map()/_node_street_map_from_graph() already
-    lean on for other per-node metadata. If that key turns out to
-    live somewhere else, only _log_card_decision()'s direction lookup
-    needs updating.
+    `response` — see _log_card_decision()'s own docstring for why this
+    file no longer tries to guess it at selection time at all.
 """
 
 from app.graph_engine_adapter import _domain_name, _game_obj
@@ -119,278 +147,6 @@ class _GraphHandStateShim:
         self.last_showdown = result if result is not None else getattr(
             engine, "last_showdown", None
         )
-
-
-def _node_street_map_from_graph(graph) -> dict[int, int]:
-    """
-    Best-effort node_index -> 1-based street number map, built by
-    walking the graph's dealing-node metadata (`deals_board_street` +
-    `node_indices`) — replaces game_def.street_nodes, which no longer
-    exists on the slimmed-down GameDefinition (see the migration
-    doc). Falls back to an empty dict on any failure — SessionLogger.
-    log_board() already defaults any un-mapped node to street=1, so an
-    empty map here degrades to the OLD (wrong-but-non-crashing)
-    behavior rather than raising.
-
-    Unlike game_service.py's _summarize_flow() (which only follows the
-    FIRST outgoing edge per node, since it just wants one
-    representative pass for wizard display), this does a full
-    visited-guarded traversal of every reachable node — logging needs
-    every dealing node's street, not just the ones on one branch.
-
-    ASSUMPTIONS: same as _summarize_flow() in game_service.py —
-    graph.node(id).metadata may contain `deals_board_street` (int) and
-    `node_indices` (list[int]); graph exposes `.start_node` (or
-    `.root`/`.entry`) and `.outgoing(id)`.
-    """
-    if graph is None:
-        return {}
-    try:
-        start = (
-            getattr(graph, "start_node", None)
-            or getattr(graph, "root", None)
-            or getattr(graph, "entry", None)
-        )
-        if start is None:
-            return {}
-
-        node_map: dict[int, int] = {}
-        visited = set()
-        frontier = [start]
-        while frontier:
-            current = frontier.pop()
-            if current in visited:
-                continue
-            visited.add(current)
-
-            node = graph.node(current)
-            metadata = dict(getattr(node, "metadata", {}) or {})
-            deals_board_street = metadata.get("deals_board_street")
-            if deals_board_street is not None:
-                for node_idx in metadata.get("node_indices", []):
-                    node_map[int(node_idx)] = int(deals_board_street)
-
-            outgoing = list(getattr(graph, "outgoing", lambda _n: [])(current))
-            for nxt in outgoing:
-                if isinstance(nxt, tuple):
-                    nxt = nxt[-1]
-                if nxt not in visited:
-                    frontier.append(nxt)
-        return node_map
-    except Exception:
-        return {}
-
-
-def _betting_node_street_map(graph) -> dict:
-    """
-    Map every BETTING-domain DECISION node id -> the 1-based board
-    street it actually belongs to, in the SAME numbering
-    board_cards.street already uses (1=flop, 2=turn, 3=river; 0 =
-    nothing dealt yet, i.e. a genuine preflop betting round).
-
-    Superseded approach, and why it was wrong
-    ------------------------------------------
-    An earlier version of this file read a betting node's OWN
-    `metadata.get("street_index")` directly and used it as-is. That
-    field is real, but it's a SEQUENTIAL BETTING-ROUND COUNTER
-    (0=first betting round in the hand, 1=second, ...) — a completely
-    different numbering from a `deal` node's own `street_index`
-    metadata (1=flop, 2=turn, 3=river — 1-based, and the one that
-    board_cards.street / _node_street_map_from_graph actually use).
-
-    For a STANDARD variant (real preflop betting round first) the two
-    conventions happen to agree after preflop: betting round 1 (flop)
-    == board street 1 (flop), round 2 (turn) == board street 2, etc. —
-    only preflop (betting round 0) has no board-street equivalent,
-    which is harmless since no board cards exist at street 0 anyway.
-    But confirmed empirically (a live flop-betting node's own metadata
-    read street_index=0, not 1): the two are NOT simply off by a
-    constant +1 either, and for a BOMB POT variant — which deals the
-    flop before any betting happens at all — the FIRST betting round
-    (also sequentially numbered 0 by this same convention) is the
-    FLOP round, needing board street=1, not 0. A blanket +1 offset
-    would be correct for the standard case and wrong for bomb pots, or
-    vice versa for a blanket "treat 0 as preflop, don't shift" rule.
-
-    The only convention-independent way to get this right for every
-    variant is to derive a betting node's street from what the FLOW
-    ITSELF most recently dealt on the way to that node, not from
-    either node's own street_index counter. This walks the graph from
-    its entry node, tracking a running "last dealt board street" value
-    (starts at 0 = nothing dealt) that gets overwritten every time a
-    `deals_board_street` node is passed, and records that value
-    against every BETTING node reached along the way — a standard
-    variant's opening betting node is reached before any deal node, so
-    it correctly resolves to 0; a bomb pot's opening betting node is
-    reached AFTER the flop's deal node, so it correctly resolves to 1.
-
-    This walk also drives _log_card_decision()'s street label for
-    CARD_SELECT/CARD_PASS nodes via _street_index_for_node() below —
-    those aren't BETTING-domain, so they're recorded separately by
-    _card_node_street_map() rather than folded into this map.
-
-    Falls back to an empty dict on any failure — on_decision() already
-    treats a missing entry as street=0, the same degraded "everything
-    on the first street" behavior _node_street_map_from_graph's own
-    empty-dict fallback accepts for board-card street stamping.
-
-    ASSUMPTIONS: same as _node_street_map_from_graph — graph.node(id)
-    exposes `.domain` (compared by `.name`, e.g. "BETTING") and
-    `.metadata` (dict, may contain `deals_board_street`); graph exposes
-    `.start_node`/`.root`/`.entry` and `.outgoing(id)`.
-    """
-    if graph is None:
-        return {}
-    try:
-        start = (
-            getattr(graph, "start_node", None)
-            or getattr(graph, "root", None)
-            or getattr(graph, "entry", None)
-        )
-        if start is None:
-            return {}
-
-        betting_street: dict = {}
-        visited = set()
-        # (node_id, street_so_far) — the running street value travels
-        # WITH the walk rather than living in one shared variable, so
-        # two branches at different points in the flow can never
-        # clobber each other's in-progress value. Overwritten (not
-        # incremented) on every deals_board_street node, so it's
-        # self-correcting regardless of what a branch's value was
-        # before reaching that node.
-        frontier = [(start, 0)]
-
-        while frontier:
-            node_id, current_street = frontier.pop()
-            if node_id in visited:
-                continue
-            visited.add(node_id)
-
-            node = graph.node(node_id)
-            domain = getattr(node, "domain", None)
-            domain_name = (
-                getattr(domain, "name", str(domain)) if domain is not None else None
-            )
-            metadata = dict(getattr(node, "metadata", {}) or {})
-
-            deals_board_street = metadata.get("deals_board_street")
-            if deals_board_street is not None:
-                current_street = int(deals_board_street)
-
-            if domain_name == "BETTING":
-                betting_street[node_id] = current_street
-
-            outgoing = list(getattr(graph, "outgoing", lambda _n: [])(node_id))
-            for nxt in outgoing:
-                if isinstance(nxt, tuple):
-                    nxt = nxt[-1]
-                if nxt not in visited:
-                    frontier.append((nxt, current_street))
-
-        return betting_street
-    except Exception:
-        return {}
-
-
-def _card_node_street_map(graph) -> dict:
-    """
-    Same walk as _betting_node_street_map(), but records the running
-    "last dealt board street" against every CARD_SELECT/CARD_PASS
-    DECISION node instead of BETTING ones — used by
-    _log_card_decision() to stamp a discard/pass with the same
-    street-as-label convention every other table already uses (Action,
-    BoardCard, CardEvent). A discard/pass node reached before any
-    board card is dealt (e.g. drawmaha's pre-flop draw) correctly
-    resolves to street=0, matching a genuine preflop BETTING node's
-    own street=0 under _betting_node_street_map().
-
-    Kept as a separate walk (rather than merging into
-    _betting_node_street_map() and returning a combined dict) so a
-    future caller that only cares about one domain doesn't have to
-    filter the other one back out — small duplication, clearer
-    call sites.
-    """
-    if graph is None:
-        return {}
-    try:
-        start = (
-            getattr(graph, "start_node", None)
-            or getattr(graph, "root", None)
-            or getattr(graph, "entry", None)
-        )
-        if start is None:
-            return {}
-
-        card_street: dict = {}
-        visited = set()
-        frontier = [(start, 0)]
-
-        while frontier:
-            node_id, current_street = frontier.pop()
-            if node_id in visited:
-                continue
-            visited.add(node_id)
-
-            node = graph.node(node_id)
-            domain = getattr(node, "domain", None)
-            domain_name = (
-                getattr(domain, "name", str(domain)) if domain is not None else None
-            )
-            metadata = dict(getattr(node, "metadata", {}) or {})
-
-            deals_board_street = metadata.get("deals_board_street")
-            if deals_board_street is not None:
-                current_street = int(deals_board_street)
-
-            if domain_name in ("CARD_SELECT", "CARD_PASS"):
-                card_street[node_id] = current_street
-
-            outgoing = list(getattr(graph, "outgoing", lambda _n: [])(node_id))
-            for nxt in outgoing:
-                if isinstance(nxt, tuple):
-                    nxt = nxt[-1]
-                if nxt not in visited:
-                    frontier.append((nxt, current_street))
-
-        return card_street
-    except Exception:
-        return {}
-
-
-def _street_index_for_node(engine, node_id) -> int:
-    """
-    Resolve the board-street number to log on Action.street for the
-    BETTING decision node `node_id` — see _betting_node_street_map()'s
-    own docstring for why this can't just read a node's own
-    street_index metadata directly.
-
-    THIS FUNCTION WAS PREVIOUSLY CALLED BUT NEVER DEFINED — every
-    on_decision() call (i.e. every single player action, of any kind)
-    raised NameError here, uncaught, which propagated up through
-    submit_decision() and surfaced as an unhandled 500 from
-    POST /game/action. Defined now as a thin wrapper around the
-    already-implemented _betting_node_street_map(graph) walk.
-
-    Recomputes the graph walk fresh on every call rather than caching
-    it on the engine/callbacks instance — actions are infrequent
-    relative to other state churn, so correctness (never serving a
-    stale map after some future graph-mutation feature) is worth more
-    here than the walk's small cost.
-    """
-    if node_id is None:
-        return 0
-    graph = getattr(engine, "graph", None)
-    return _betting_node_street_map(graph).get(node_id, 0)
-
-
-def _card_street_index_for_node(engine, node_id) -> int:
-    """CARD_SELECT/CARD_PASS sibling of _street_index_for_node() — see
-    _card_node_street_map()'s own docstring."""
-    if node_id is None:
-        return 0
-    graph = getattr(engine, "graph", None)
-    return _card_node_street_map(graph).get(node_id, 0)
 
 
 class BackendGraphEngineCallbacks:
@@ -452,11 +208,10 @@ class BackendGraphEngineCallbacks:
                 "ended_at": None,
                 "players": g.players,
                 "game_def": gd,
-                # See _node_street_map_from_graph()'s own docstring —
-                # replaces game_def.street_nodes, which no longer exists.
-                "node_street_map": _node_street_map_from_graph(
-                    getattr(engine, "graph", None)
-                ),
+                # node_street_map dropped — street is no longer derived
+                # from graph metadata anywhere (see module docstring),
+                # and SessionLogger.start_hand() never consumed this
+                # key in the first place.
             }
         )
 
@@ -466,34 +221,50 @@ class BackendGraphEngineCallbacks:
 
         g = _game_obj(engine)
 
-        # Persist any board cards revealed since the last decision (or
-        # since hand start) BEFORE logging this action. GraphEngine
-        # auto-runs every AUTO node — including `deal` — up to the next
-        # DECISION node with no external pause, so by the time a player
-        # submits THIS decision, whatever street was dealt in between is
-        # already sitting in g.node_cards. Calling log_board() here,
-        # once per decision, is what gives each street its own reveal
-        # group (see SessionLogger.log_board / log_board's own
-        # docstring) — previously this only happened once, at showdown
-        # (on_showdown -> finish_hand -> log_board), which is why every
-        # board card ended up batched into a single reveal regardless of
-        # street numbering.
+        # Persist any board cards revealed, AND any extra hole cards
+        # dealt (ESG / Catchup ESG / Christmas / Grinch's
+        # deal_extra_hole_card, or a CARD_SELECT redraw's replacement
+        # cards) since the last decision. Both are AUTO-node side
+        # effects the engine runs with no pause in between — by the
+        # time a player submits THIS decision, anything dealt in
+        # between is already sitting in g.node_cards / player
+        # hand_masks. log_board() MUST run first: it's the only place
+        # that advances SessionLogger's street counter, and everything
+        # logged below (hole cards from this same AUTO-walk, and the
+        # decision itself) needs to be stamped with whatever that
+        # counter reads AFTER this potential advance.
         self.logger.log_board(_GraphHandStateShim(engine))
+
+        current_street = self.logger.current_street()
+        self.logger.log_hole_cards(_GraphHandStateShim(engine), street=current_street)
 
         player_index = self._pending_player_index
         if player_index is None:
-            # note_pre_decision() wasn't called first — fall back to
-            # whatever the response itself claims.
             player_index = getattr(response, "player_index", None)
 
-        # CARD_SELECT / CARD_PASS dispatch — neither domain's `value`
-        # is an Action, so route to the card-movement write path
-        # BEFORE any of the Action-shaped BETTING logic below runs.
-        # See _log_card_decision()'s own docstring for the two
-        # domains' write shapes and the CARD_PASS target-seat lookup.
         domain_name = _domain_name(getattr(response, "domain", None))
+
         if domain_name in ("CARD_SELECT", "CARD_PASS"):
-            self._log_card_decision(engine, response, player_index, domain_name)
+            self._log_card_decision(
+                engine, response, player_index, domain_name, current_street
+            )
+            self._pending_player_index = None
+            self._pending_pot_before = None
+            self._pending_stack_before = None
+            return
+
+        # BOOLEAN / CHOICE — neither domain's `value` is an Action
+        # (BOOLEAN's is a plain bool; CHOICE's is a plain str — see
+        # core_types.py's DecisionResponse.value table), so route both
+        # to a dedicated logger method BEFORE falling into the
+        # Action-shaped BETTING logic below. Without this branch, a
+        # Grinch "Christmas next street?" decision fell straight
+        # through into the BETTING path, which reads `.type`/`.amount`
+        # off `response.value` — a bool/str has neither.
+        if domain_name in ("BOOLEAN", "CHOICE"):
+            self._log_boolean_or_choice_decision(
+                engine, response, player_index, domain_name, current_street
+            )
             self._pending_player_index = None
             self._pending_pot_before = None
             self._pending_stack_before = None
@@ -510,29 +281,6 @@ class BackendGraphEngineCallbacks:
         ):
             stack_before = g.players[player_index].stack
 
-        # `value` is CONFIRMED now (see game_service.py's
-        # _build_decision_response, fixed after "response.value must be
-        # an Action" surfaced at runtime): a real
-        # poker_engine.actions.action.Action, whose action-identity
-        # field is `.type` (an ActionType enum member), NOT
-        # `.action_type` — reading `.action_type` here always returned
-        # None, which silently wrote NULL into actions.action_type on
-        # every single logged action (no crash on write; DB allowed the
-        # NULL) until it blew up downstream as a pydantic
-        # ValidationError the first time that hand was read back via
-        # GET /replay/hands/{id} ("Input should be a valid string
-        # [type=string_type], input_value=None"). `.type` is unwrapped
-        # to its `.name` string exactly the way engine_callbacks.py's
-        # own on_action does for the PokerState path
-        # (`action.type.name`), so both callback implementations write
-        # the same action_type string shape into the DB.
-        #
-        # The dict / bare-"action_type"-attribute branches are kept
-        # only as defensive fallbacks for a value shape that isn't the
-        # real Action (e.g. editing-mode replay tooling, or a future
-        # non-BETTING domain whose value isn't an Action at all) —
-        # they are no longer the expected path for a live BETTING
-        # decision.
         value = getattr(response, "value", None)
         if isinstance(value, dict):
             action_type = value.get("action_type")
@@ -541,13 +289,11 @@ class BackendGraphEngineCallbacks:
             action_type = getattr(value, "type", None)
             if action_type is None:
                 action_type = getattr(value, "action_type", None)
-            action_type = getattr(action_type, "name", action_type)  # enum -> "FOLD"
+            action_type = getattr(action_type, "name", action_type)
             amount = getattr(value, "amount", None)
 
-        street = _street_index_for_node(engine, getattr(response, "node_id", None))
-
         self.logger.log_action(
-            street=street,
+            street=current_street,
             player_index=player_index,
             action=action_type,
             amount=amount,
@@ -559,13 +305,71 @@ class BackendGraphEngineCallbacks:
         self._pending_pot_before = None
         self._pending_stack_before = None
 
-    def _log_card_decision(self, engine, response, player_index, domain_name):
+    def _log_boolean_or_choice_decision(
+        self, engine, response, player_index, domain_name, current_street
+    ):
+        """
+        Persist a BOOLEAN (e.g. Grinch's "Christmas next street?") or
+        CHOICE decision via SessionLogger.log_action(), reusing the
+        Action table rather than adding a new one — action_type is
+        stamped as "BOOLEAN"/"CHOICE" (not a real ActionType member,
+        but Action.action_type is a free-text column — see hands.py's
+        schema note that action_type already isn't a strict ActionType
+        enum on the DB side, e.g. "SEAT" synthetic rows) and `amount`
+        is repurposed to encode the answer: 1/0 for BOOLEAN's
+        true/false, left NULL for CHOICE (its answer is a string, not
+        representable in an int column — the actual chosen label is
+        only recoverable from a richer log if this ever needs to be
+        queried directly; acceptable for now since no shipped variant
+        uses CHOICE yet).
+
+        If player_index is unresolvable, skip logging (mirrors
+        _log_card_decision's own guard) rather than write a row with
+        no attributable player.
+
+        `current_street` is passed in by on_decision() (already
+        resolved once via self.logger.current_street() after
+        log_board() ran) rather than re-resolved here, so a BOOLEAN/
+        CHOICE decision is guaranteed to log the same street value any
+        board-card reveal earlier in this same call would have used.
+        """
+        if player_index is None:
+            return
+
+        value = getattr(response, "value", None)
+
+        if domain_name == "BOOLEAN":
+            action_label = "BOOLEAN"
+            amount = 1 if bool(value) else 0
+        else:  # CHOICE
+            action_label = "CHOICE"
+            amount = None
+
+        pot_before = (
+            self._pending_pot_before
+            if self._pending_pot_before is not None
+            else _game_obj(engine).pot
+        )
+        stack_before = self._pending_stack_before
+
+        self.logger.log_action(
+            street=current_street,
+            player_index=player_index,
+            action=action_label,
+            amount=amount,
+            pot_before=pot_before,
+            stack_before=stack_before,
+        )
+
+    def _log_card_decision(
+        self, engine, response, player_index, domain_name, current_street
+    ):
         """
         Persist a CARD_SELECT (drawmaha-style discard) or CARD_PASS
         (pass-the-trash-style) decision via card_movement.py (through
-        SessionLogger.log_card_select()/log_card_pass()), so
-        HoleCard/CardEvent stay in sync the same way BETTING actions
-        already do through log_action().
+        SessionLogger.log_card_select()), so HoleCard/CardEvent stay
+        in sync the same way BETTING actions already do through
+        log_action().
 
         response.value is Tuple[int, ...] — the engine card ids the
         player selected from their OWN hand (see core_types.py and
@@ -576,73 +380,65 @@ class BackendGraphEngineCallbacks:
         to the muck — no destination player to resolve.
 
         CARD_PASS's target seat is resolved automatically by the
-        engine (CardPassResolver, from a fixed "left"/"right" config
-        rule — see game_api.py's ActionRequest docstring) and is NOT
-        part of `response`. This reads a `pass_direction` key
-        ("left" | "right") off the current graph node's metadata —
-        see module docstring's ASSUMPTIONS — and derives the target
-        seat as (player_index ± 1) % n. If that key is missing, or
-        engine.graph/g.players aren't available for any reason, this
-        falls back to logging the cards as a plain discard instead of
-        a pass: it's the safer degradation (the giver's own hand state
-        stays correct — cards leave it either way) versus guessing a
-        target seat and silently attributing the pass to the wrong
-        player. A warning is printed either way so it's diagnosable
-        rather than a silently wrong replay.
+        engine (CardPassResolver — real routing, including which
+        seats to skip, e.g. folded/eliminated players) and is NOT
+        part of `response`, so it can't be logged here at all. Every
+        CARD_PASS selection is logged as a plain discard (give-side
+        only) — always correct regardless of routing, since the
+        giver's own hand definitely loses these cards no matter where
+        they end up. on_cards_distributed() is SOLELY responsible for
+        the receiving side, via its existing diff-based
+        log_hole_cards() call, which reads the Engine's real
+        post-distribution state rather than guessing.
+
+        `current_street` — same passed-in value on_decision() already
+        resolved, see _log_boolean_or_choice_decision()'s own note.
         """
         # NOTE: card_ids=() is a legal "stood pat / selected zero cards"
         # response (min_count can be 0 — see drawmaha's discard config),
         # not a missing one — only player_index being unresolvable is a
-        # real reason to skip logging. An earlier version of this check
-        # was `if not card_ids or player_index is None`, which silently
-        # dropped standing-pat responses from the log entirely (no
-        # correctness impact on gameplay — CardSelectResolver.apply()
-        # already marks the player as acted on the engine side
-        # independent of this logging call — but it meant a player who
-        # stood pat left no history/replay trace of having acted at all).
+        # real reason to skip logging.
         card_ids = tuple(getattr(response, "value", None) or ())
-        street = _card_street_index_for_node(
-            engine, getattr(response, "node_id", None)
-        )
 
         if player_index is None:
             return
 
-        if domain_name == "CARD_SELECT":
-            self.logger.log_card_select(street, player_index, card_ids)
+        self.logger.log_card_select(current_street, player_index, card_ids)
+
+    def on_cards_distributed(self, engine, distributed_passes=None):
+        """
+        Fires once every eligible CARD_PASS player has submitted and
+        the engine has moved the passed cards into their targets'
+        hand_masks (poker_engine/graph/callbacks.py:145 —
+        `callbacks.on_cards_distributed(engine,
+        engine.last_distributed_passes)`).
+
+        Deliberately does NOT try to replay `distributed_passes` card
+        -by-card — its exact shape isn't confirmed against real Engine
+        source (unlike DecisionResponse.value, which the migration doc
+        pinned down explicitly per domain). Instead, reuses the same
+        diff-based mechanism SessionLogger.log_hole_cards() already
+        provides for extra-card mechanics and CARD_SELECT redraws:
+        compare each player's CURRENT hand_mask (now updated by the
+        engine's real distribution) against what's already been
+        logged, and log whatever's new — under whatever street
+        self.logger.current_street() reads AFTER log_board() has run
+        for this snapshot, same ordering on_decision() uses, so a
+        pass-the-trash card lands on the street it was actually passed
+        on rather than one early.
+
+        This is now the ONLY place CARD_PASS's receiving side is ever
+        logged — _log_card_decision() (above) only ever logs the
+        GIVING side (as a discard) at selection time, specifically so
+        the receiving side always comes from the Engine's real
+        post-distribution state rather than a guess.
+        """
+        if self._is_editing():
             return
 
-        # CARD_PASS — resolve target seat from node metadata.
-        g = _game_obj(engine)
-        n = len(getattr(g, "players", []) or [])
-        graph = getattr(engine, "graph", None)
-        node_id = getattr(response, "node_id", None)
-
-        direction = None
-        if graph is not None and node_id is not None:
-            try:
-                node = graph.node(node_id)
-                metadata = dict(getattr(node, "metadata", {}) or {})
-                direction = metadata.get("pass_direction")
-            except Exception:
-                direction = None
-
-        target_index = None
-        if n and direction == "left":
-            target_index = (player_index + 1) % n
-        elif n and direction == "right":
-            target_index = (player_index - 1) % n
-
-        if target_index is None:
-            print(
-                f"[graph_engine_callbacks] CARD_PASS at node {node_id!r} has "
-                f"no resolvable pass_direction in node metadata — logging "
-                f"as a discard instead of a pass (target player unknown)."
-            )
-            self.logger.log_card_select(street, player_index, card_ids)
-            return
-
-        self.logger.log_card_pass(street, player_index, target_index, card_ids)
+        self.logger.log_board(_GraphHandStateShim(engine))
+        current_street = self.logger.current_street()
+        self.logger.log_hole_cards(_GraphHandStateShim(engine), street=current_street)
 
     def on_showdown(self, engine, result=None):
         if self._is_editing():

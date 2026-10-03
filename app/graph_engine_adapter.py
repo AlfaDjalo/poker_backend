@@ -110,11 +110,51 @@ def _options_to_dto(g, req) -> list[DecisionOptionDTO]:
     ActionRequest's own docstring in game_api.py.
     """
     options = getattr(req, "options", ()) or ()
+    domain_name = _domain_name(getattr(req, "domain", None))
     out = []
     for opt in options:
+        # TEMP DIAGNOSTIC: pass-the-trash still reports "Selection
+        # requirements unavailable" after the count-fallback fix below,
+        # meaning the redesigned (simultaneous discard-then-pass)
+        # option shape isn't min_count/max_count OR count. Dump every
+        # public attribute on the raw option object so the real shape
+        # is visible in the server console next reproduction — remove
+        # once the correct field name is confirmed.
+        if domain_name in ("CARD_SELECT", "CARD_PASS"):
+            raw_attrs = {
+                k: v for k, v in vars(opt).items()
+                if not k.startswith("_")
+            } if hasattr(opt, "__dict__") else {
+                k: getattr(opt, k) for k in dir(opt)
+                if not k.startswith("_") and not callable(getattr(opt, k, None))
+            }
+            print(f"[graph_engine_adapter] {domain_name} option raw attrs: {raw_attrs}")
+
         name = _option_action_name(opt)
         min_count = getattr(opt, "min_count", None)
         max_count = getattr(opt, "max_count", None)
+
+        # A FIXED-count option (e.g. pass-the-trash: "pass exactly 3
+        # cards", no min/max range at all) may be exposed by the
+        # Engine as a single `count` field rather than min_count ==
+        # max_count. Previously only min_count/max_count were read, so
+        # a fixed-count option came through as min_count=None,
+        # max_count=None — DecisionOptionDTO validated fine (both are
+        # optional) but the frontend, seeing neither, had no way to
+        # know how many cards were required and correctly refused to
+        # enable Confirm ("The server didn't report how many cards to
+        # pass"). Falling back to `count` here (only when min/max
+        # aren't already provided) surfaces it as min_count==max_count
+        # ==count, which is exactly how a fixed requirement is meant
+        # to be represented on the wire per DecisionOptionDTO's own
+        # docstring.
+        fixed_count = getattr(opt, "count", None)
+        if fixed_count is not None:
+            if min_count is None:
+                min_count = fixed_count
+            if max_count is None:
+                max_count = fixed_count
+
         is_card_select_shaped = min_count is not None or max_count is not None
 
         if name is None and not is_card_select_shaped:

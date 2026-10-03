@@ -45,6 +45,19 @@ scenarios:
 
     betting_type: push_fold
 
+    # GraphEngine migration — see RL Lab coordination thread ("Migrate
+    # trainer_service.py / push_fold_service.py off PokerState onto
+    # GraphEngine"). `true` means: load
+    # poker_rl_lab/scenarios/graph_scenarios/push_fold_duo.yaml (same
+    # stem as this scenario's own key) as this scenario's
+    # GraphScenarioConfig, and drive it via GraphScenarioEnv in
+    # TrainerService rather than the legacy PokerState path. Chosen as
+    # the first scenario to migrate because RL Lab confirmed it needs
+    # neither Backend-owned gap fix (villain_matches_hero_range /
+    # pot_bb) — plain random deal, standard posted blinds, StackConfig
+    # alone covers it.
+    graph_scenario_key: true
+
     # Hero always occupies this engine seat; the opponent (villain)
     # seat is always the other one. Position (SB/BB) is randomized per
     # scenario by rotating dealer_position, not by swapping which

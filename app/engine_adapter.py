@@ -39,27 +39,6 @@ def _mask_to_card_strs(mask: int) -> list:
     return cards
 
 
-def _board_card_mask(node_cards, node_mask: int) -> int:
-    """
-    Convert a PointResult's node_mask — a bitmask of NODE POSITIONS
-    ("bitmask of node indices (union across node_sets)", per the
-    hand_points.node_set DB column's own doc comment), not card ids —
-    into the actual 52-bit CARD mask for that board, by looking up
-    which card is dealt at each set node position. Needed because
-    best_hand_mask is a card mask; intersecting it against a
-    node-POSITION mask directly would be comparing the wrong units.
-    """
-    if not node_cards or not node_mask:
-        return 0
-    mask = 0
-    for node_idx, card_id in enumerate(node_cards):
-        if card_id is None:
-            continue
-        if (node_mask >> node_idx) & 1:
-            mask |= 1 << card_id
-    return mask
-
-
 def state_to_dto(poker_state):
 
     g = poker_state.game
@@ -229,9 +208,14 @@ def build_showdown_dto(result, rules, active_players, node_cards=None, player_ha
 
     active_players: list of player indices in the order
                     the scoring engine evaluated them.
-    node_cards: g.node_cards (list[int|None], indexed by node position)
-                — used with a PointResult's node_mask to derive the
-                real card mask for that board (see _board_card_mask).
+    node_cards: UNUSED as of the node_mask fix below — kept only for
+                call-site backward compatibility (both call sites
+                still pass g.node_cards). PointResult.node_mask turned
+                out to already BE a real 52-bit card mask (confirmed
+                live: its magnitude matches best_hand_mask exactly),
+                not a node-position bitmask as originally assumed —
+                see board_mask's own inline comment further down. No
+                node_cards lookup is needed to derive it anymore.
     player_hand_masks: {player_index: hand_mask} — each active
                 player's own hole-card bitmask, for splitting
                 best_hand_mask into its hole vs board components.
@@ -253,14 +237,14 @@ def build_showdown_dto(result, rules, active_players, node_cards=None, player_ha
     know which of the pre-split attributes are real:
       - best_hand_cards      = decode(best_hand_mask)
       - hole_cards_used      = decode(best_hand_mask & player's own hand_mask)
-      - board_cards_used     = decode(best_hand_mask & this board's card mask)
+      - board_cards_used     = decode(best_hand_mask & this board's card mask,
+                                       i.e. best_hand_mask & node_mask directly)
 
-    node_cards/player_hand_masks default to None for backward
-    compatibility with any other caller that doesn't have them handy
-    — best_hand_cards still decodes fine in that case, but
-    hole_cards_used/board_cards_used fall back to empty (same
-    degraded behavior as before) since there's nothing to split
-    against.
+    player_hand_masks defaults to None for backward compatibility with
+    any other caller that doesn't have it handy — best_hand_cards
+    still decodes fine in that case, but hole_cards_used falls back to
+    empty (same degraded behavior as before) since there's nothing to
+    split against. board_cards_used no longer depends on this at all.
     """
     if result is None:
         return None
@@ -268,6 +252,7 @@ def build_showdown_dto(result, rules, active_players, node_cards=None, player_ha
     player_hand_masks = player_hand_masks or {}
 
     # point_results = []
+
 
     grouped = {}
 
@@ -298,9 +283,24 @@ def build_showdown_dto(result, rules, active_players, node_cards=None, player_ha
         for board_idx, board_obj in enumerate(data["boards"]):
 
             results = board_obj.results
-            board_mask = _board_card_mask(
-                node_cards, getattr(board_obj, "node_mask", 0)
-            )
+            # node_mask is ALREADY a real 52-bit card mask (confirmed
+            # live: its magnitude matches best_hand_mask, e.g.
+            # node_mask=1125899909088256 alongside a
+            # best_hand_mask=1196268653118592 for the same hand) — NOT
+            # a small node-position bitmask (0b11111 for a 5-node
+            # board) as hand_points.node_set's own doc comment and
+            # _board_card_mask() both assumed. Running it through that
+            # node-index conversion checked bits 0-4 of what's really
+            # already a card mask, which are essentially always zero
+            # (real card ids rarely land under bit 5), producing
+            # board_mask=0 (or an occasional garbage partial value)
+            # and therefore an always-empty board_cards_used. Use it
+            # directly — no conversion needed.
+            board_mask = getattr(board_obj, "node_mask", 0) or 0
+
+            # print("board_obj: ", board_obj)
+            # print("board_mask: ", board_mask)
+            # print("board_cards: ", _mask_to_card_strs(board_mask))
 
             players = []
             winners = []
@@ -315,6 +315,8 @@ def build_showdown_dto(result, rules, active_players, node_cards=None, player_ha
 
                 best_hand_mask = getattr(r, "best_hand_mask", 0) or 0
                 hole_mask = player_hand_masks.get(p_index, 0)
+
+                # print("board_cards used: ", _mask_to_card_strs(best_hand_mask & board_mask))
 
                 players.append(
                     PlayerBoardResultDTO(

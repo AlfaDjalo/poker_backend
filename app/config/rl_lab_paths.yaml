@@ -1,0 +1,35 @@
+# app/config/rl_lab_paths.yaml
+#
+# Points the backend at RL Lab's OWN scenario-config and model
+# directories — see RL_LAB_COORDINATION_REQUEST.md for the full
+# contract. RL Lab owns the content of these directories; the backend
+# only needs to know where they are.
+#
+# Resolution order for each path (see trainer_config.py):
+#   1. The matching env var (POKER_RL_LAB_SCENARIOS_DIR /
+#      POKER_RL_LAB_MODELS_DIR), if set — highest priority, for
+#      per-deployment overrides without editing this file.
+#   2. The value set here, if non-null. May be absolute, or relative
+#      to this file's own directory (app/config/).
+#   3. Default: resolved relative to the installed poker_rl_lab
+#      package itself (<poker_rl_lab pkg dir>/scenarios,
+#      <poker_rl_lab pkg dir>/models).
+#
+# Leave both null for local dev against a normally-installed
+# poker_rl_lab — only set these once RL Lab confirms (per §4 of the
+# coordination doc) that scenarios/models don't simply live inside the
+# installed package in this environment.
+
+scenarios_dir: null
+models_dir: null
+
+# RL Lab's own GraphScenarioConfig directory (one YAML per training
+# scenario, e.g. graph_scenarios/push_fold_duo.yaml) — see
+# trainer_config.py's _default_graph_scenarios_dir(). Same three-tier
+# resolution as scenarios_dir/models_dir above (env var
+# POKER_RL_LAB_GRAPH_SCENARIOS_DIR > this key > <poker_rl_lab pkg
+# dir>/graph_scenarios). Only its FILE PRESENCE is ever checked by
+# Backend (to auto-detect which Trainer scenarios have a
+# GraphScenarioEnv counterpart available — no manual per-scenario flag
+# to maintain); RL Lab owns parsing its actual contents.
+graph_scenarios_dir: null

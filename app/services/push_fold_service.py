@@ -86,6 +86,15 @@ HUMAN_STACK_BB = 100.0
 AGENT_MIN_STACK_BB = 5.0
 AGENT_MAX_STACK_BB = 25.0
 
+# Explicit now — GameDefinition (as returned by the now-unified
+# load_game()) no longer carries small_blind/big_blind at all (see
+# game_definition.py's own docstring: "betting type/blinds/ante... now
+# flow-step config"). These MUST agree with whatever push_fold.yaml's
+# own flow: post_blinds step actually posts — nothing cross-checks that
+# for this legacy PokerState-based path anymore.
+SMALL_BLIND = 1
+BIG_BLIND = 2
+
 ENGINE_VARIANT_NAME = "push_fold"  # drives real legal actions / showdown
 RL_GAME_NAME = "holdem"  # matches the policy's training-time observations
 
@@ -209,8 +218,8 @@ class PushFoldService:
     def new_hand(self) -> dict[str, Any]:
         self._ensure_agent()
 
-        game_def, rules = load_game(ENGINE_VARIANT_NAME)
-        big_blind = game_def.big_blind
+        game_def, rules, graph = load_game(ENGINE_VARIANT_NAME)
+        big_blind = BIG_BLIND
 
         agent_bb = round(random.uniform(AGENT_MIN_STACK_BB, AGENT_MAX_STACK_BB), 1)
         human_chips = max(big_blind, round(HUMAN_STACK_BB * big_blind))
@@ -431,8 +440,8 @@ class PushFoldService:
         sb_seat, bb_seat = self._sb_seat(), self._bb_seat()
         sb_player, bb_player = g.players[sb_seat], g.players[bb_seat]
 
-        small_blind = self.state.game_def.small_blind
-        big_blind = self.state.game_def.big_blind
+        small_blind = SMALL_BLIND
+        big_blind = BIG_BLIND
         pot_before_push = small_blind + big_blind
         push_amount = sb_player.current_bet - small_blind
         pot_fraction = (push_amount / pot_before_push) if pot_before_push > 0 else 0.0
@@ -507,7 +516,7 @@ class PushFoldService:
         payload = dto.dict()
 
         g = self.state.game
-        big_blind = self.state.game_def.big_blind
+        big_blind = BIG_BLIND
         payload.update(
             {
                 "active": True,
