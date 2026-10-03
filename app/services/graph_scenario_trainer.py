@@ -314,7 +314,28 @@ def hero_allowed_labels_graph(session: GraphScenarioSession) -> List[str]:
     ]
 
 
-def _match_hero_option(session: GraphScenarioSession, action_label: str):
+def hero_action_options_graph(session: GraphScenarioSession) -> Optional[List[Dict[str, Any]]]:
+    """Serialize the current discrete graph options, retaining sized
+    BETTING option identity and exact engine amount for the Trainer UI."""
+    if not _current_seat_is(session, session.hero_rl_seat):
+        return None
+    if session.current_obs.domain != "BETTING":
+        return None
+
+    options = []
+    for option in session.current_obs.options:
+        action_type = _trainer_action_label(session.env, session.hero_rl_seat, option)
+        engine_type = getattr(option.engine_action_type, "name", None)
+        is_sized_bet = engine_type in ("BET", "RAISE")
+        options.append({
+            "action_type": action_type,
+            "amount": option.amount if is_sized_bet else None,
+            "label": option.label,
+        })
+    return options
+
+
+def _match_hero_option(session: GraphScenarioSession, action_label: str, amount: int | None = None):
     """Returns (index, option). Matches against the SAME Trainer-level
     vocabulary hero_allowed_labels_graph() reports (fold/check/call/
     bet/all_in — see _trainer_action_label's own docstring), not raw
@@ -332,25 +353,38 @@ def _match_hero_option(session: GraphScenarioSession, action_label: str):
     env = session.env
     options = session.current_obs.options
     label_lower = (action_label or "").lower()
+    matches = []
     for i, opt in enumerate(options):
-        if _trainer_action_label(env, session.hero_rl_seat, opt) == label_lower:
-            return i, opt
+        if _trainer_action_label(env, session.hero_rl_seat, opt) != label_lower:
+            continue
+        if amount is not None and opt.amount != amount:
+            continue
+        matches.append((i, opt))
+
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise ValueError(
+            f"Action {action_label!r} matches multiple legal bet sizes; "
+            "submit the selected option's exact amount."
+        )
 
     legal = [_trainer_action_label(env, session.hero_rl_seat, o) for o in options]
     raise ValueError(
-        f"Action {action_label!r} is not among the legal options right now "
+        f"Action {action_label!r} with amount {amount!r} is not among the legal options right now "
         f"(legal: {legal})"
     )
 
 
 def apply_hero_action_graph(
-    session: GraphScenarioSession, cfg: ScenarioConfig, action_label: str
+    session: GraphScenarioSession, cfg: ScenarioConfig, action_label: str,
+    amount: int | None = None,
 ) -> Dict[str, Any]:
     """Apply the hero's decision, grade it, run the villain's
     response(s). Does NOT touch the Scoreboard — caller (TrainerService)
     records the returned dict there, same as the legacy path."""
     obs = session.current_obs
-    index, option = _match_hero_option(session, action_label)
+    index, option = _match_hero_option(session, action_label, amount)
 
     result = _grade_decision_graph(session, cfg, obs, option)
 
@@ -398,10 +432,25 @@ def _grade_decision_graph(
     agent = get_graph_agent(cfg)
     probs = agent.action_probabilities(seat=obs.seat, obs=rep_input, legal_mask=obs.legal_mask)
 
-    labels = [_trainer_action_label(env, obs.seat, o) for o in obs.options]
+    labels = [
+        (
+            f"bet_{o.amount}"
+            if o.engine_action_type is not None
+            and o.engine_action_type.name in ("BET", "RAISE")
+            and _trainer_action_label(env, obs.seat, o) == "bet"
+            else _trainer_action_label(env, obs.seat, o)
+        )
+        for o in obs.options
+    ]
     probs_by_label = {label: float(probs[i]) for i, label in enumerate(labels)}
 
-    chosen_label = _trainer_action_label(env, obs.seat, chosen_option)
+    chosen_label = (
+        f"bet_{chosen_option.amount}"
+        if chosen_option.engine_action_type is not None
+        and chosen_option.engine_action_type.name in ("BET", "RAISE")
+        and _trainer_action_label(env, obs.seat, chosen_option) == "bet"
+        else _trainer_action_label(env, obs.seat, chosen_option)
+    )
     best_label = max(labels, key=lambda l: probs_by_label.get(l, 0.0)) if labels else chosen_label
     correct = best_label == chosen_label
 
@@ -523,6 +572,7 @@ def get_state_dto_graph(session: GraphScenarioSession, cfg: ScenarioConfig) -> D
             "hero_effective_bb": session.hero_effective_bb,
             "awaiting_hero": session.awaiting_hero,
             "hero_allowed_actions": hero_allowed_labels_graph(session),
+            "hero_action_options": hero_action_options_graph(session),
             "hand_over": session.done,
             "action_log": list(session.action_log),
             "hand_id": session.hand_id,

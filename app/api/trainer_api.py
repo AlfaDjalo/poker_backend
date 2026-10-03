@@ -25,6 +25,7 @@ router = APIRouter(prefix="/trainer")
 
 class TrainerActionRequest(BaseModel):
     action_type: str  # "fold" | "check" | "call" | "bet" | "all_in"
+    amount: int | None = None  # exact total bet/raise amount for a graph option
 
 
 class TrainerCheckpointRequest(BaseModel):
@@ -97,7 +98,7 @@ def get_state():
 def apply_action(req: TrainerActionRequest):
     """Submit the hero's decision; graded against the scenario's evaluator."""
     try:
-        return trainer_service.apply_hero_action(req.action_type)
+        return trainer_service.apply_hero_action(req.action_type, req.amount)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:

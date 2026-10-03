@@ -1248,7 +1248,7 @@ class TrainerService:
     # Hero decision
     # ------------------------------------------------------------
 
-    def apply_hero_action(self, action_type: str) -> Dict[str, Any]:
+    def apply_hero_action(self, action_type: str, amount: int | None = None) -> Dict[str, Any]:
         if self.scenario_key is None or (self.state is None and self._graph_session is None):
             raise ValueError("No active trainer scenario. Call new_scenario() first.")
 
@@ -1261,7 +1261,7 @@ class TrainerService:
             cfg = get_training_config().get_scenario(self.scenario_key)
 
             if cfg.is_graph_migrated():
-                return self._apply_hero_action_graph(cfg, action_type)
+                return self._apply_hero_action_graph(cfg, action_type, amount)
 
             if not self._is_hero_turn(cfg):
                 raise ValueError("Not the hero's turn to act.")
@@ -1336,7 +1336,9 @@ class TrainerService:
         finally:
             self._busy = False
 
-    def _apply_hero_action_graph(self, cfg: ScenarioConfig, action_type: str) -> Dict[str, Any]:
+    def _apply_hero_action_graph(
+        self, cfg: ScenarioConfig, action_type: str, amount: int | None = None
+    ) -> Dict[str, Any]:
         """
         Graph-migrated counterpart of apply_hero_action()'s body above
         — delegates the actual GraphScenarioEnv stepping/grading to
@@ -1350,7 +1352,9 @@ class TrainerService:
         if self._graph_session is None:
             raise ValueError("No active trainer scenario. Call new_scenario() first.")
 
-        result_dict = _graph.apply_hero_action_graph(self._graph_session, cfg, action_type)
+        result_dict = _graph.apply_hero_action_graph(
+            self._graph_session, cfg, action_type, amount
+        )
         self.awaiting_hero = self._graph_session.awaiting_hero
 
         payload = self.get_state()
